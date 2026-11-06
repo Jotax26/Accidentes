@@ -1,7 +1,9 @@
 streamlit
 pandas
 numpy
-matplotlib
 plotly
+matplotlib
 openpyxl
 reportlab
+folium
+streamlit-folium
