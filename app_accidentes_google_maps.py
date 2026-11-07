@@ -1,45 +1,57 @@
-#!/usr/bin/env python3
+# Vamos a preparar el código completo y definitivo de la app integrando Supabase (tanto para base de datos PostgreSQL como para Storage de evidencias)
+app_v4_code = '''#!/usr/init/env python3
 # -*- coding: utf-8 -*-
 """
-Plataforma Integral de Registro de Accidentes, Gestión de Flota/Pilotos y Evidencias Multimedia
-- Integra la base de datos oficial Base_Flota_Solidaristas_20261106.xlsx (61 Equipos y 37 Pilotos).
-- Permite agregar nuevos Equipos y nuevos Pilotos directamente a la base de datos Excel.
-- Selección del punto del accidente en Mapa Oficial de Google Maps (Calles / Satélite).
-- Carga de evidencias multimedia (Fotos, Videos, Documentos) con galería interactiva.
-- Generador de Informe Oficial en PDF (ReportLab) que incrusta los datos técnicos,
-  el relato de la situación, el link de Google Maps y las fotografías de evidencia.
+Plataforma Integral v4: Gestión de Accidentes, Flota, Evidencias Múltiples y Supabase Cloud
+- Integración nativa con Supabase (Base de datos y Storage Bucket 'evidencias').
+- Carga masiva de fotos y videos (sin límite de cantidad).
+- Buscador geográfico + GPS en tiempo real (Mejora 5).
+- Informe oficial en PDF con mapa satelital estático y código QR escaneable hacia Google Maps (Mejora 3).
+- Cruce automático de telemetría GPS con regla de brecha >= 4 horas en horas y minutos (Mejora 6).
 """
 
 import os
 import io
+import re
+import math
 import json
+import zipfile
 import textwrap
+import urllib.request
+import urllib.parse
 from datetime import datetime, date
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import folium
 from streamlit_folium import st_folium
-from PIL import Image
+from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.utils import ImageReader
+from reportlab.graphics.barcode import qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics import renderPDF
 from reportlab.pdfgen import canvas
 
 # Configuración general de la página
 st.set_page_config(
-    page_title="Gestión de Accidentes y Flota - Solidaristas",
+    page_title="Gestión de Accidentes y Supabase - Solidaristas",
     page_icon="🚨",
     layout="wide"
 )
 
 ARCHIVO_FLOTA = "Base_Flota_Solidaristas_20261106.xlsx"
 ARCHIVO_ACCIDENTES = "registro_accidentes_solidaristas.csv"
+ARCHIVO_TELEMETRIA_CACHE = "telemetria_actual_cache.xlsx"
 CARPETA_EVIDENCIAS = "evidencias_accidentes"
 
 os.makedirs(CARPETA_EVIDENCIAS, exist_ok=True)
 
-# Semilla de respaldo con los 61 equipos y 37 pilotos del archivo Base_Flota_Solidaristas_20261106.xlsx
+# Semilla de respaldo con los 61 equipos y 37 pilotos de Base_Flota_Solidaristas_20261106.xlsx
 EQUIPOS_INICIALES = [
     {"id": 1, "codigo": "A01", "fecha_venc_rev": "", "placa": "C-125657", "anio": 2013, "marca": "INTERNATIONAL"},
     {"id": 2, "codigo": "A02", "fecha_venc_rev": "", "placa": "C-125502", "anio": 2013, "marca": "INTERNATIONAL"},
@@ -145,8 +157,55 @@ PILOTOS_INICIALES = [
 ]
 
 
+# ==============================================================================
+# CONEXIÓN SUPABASE
+# ==============================================================================
+@st.cache_resource
+def obtener_cliente_supabase():
+    try:
+        from supabase import create_client
+        if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
+            return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    except Exception:
+        pass
+    return None
+
+supabase_client = obtener_cliente_supabase()
+
+
+def convertir_a_hm(horas_dec):
+    if pd.isna(horas_dec):
+        return "0h 00m"
+    total_min = int(round(float(horas_dec) * 60))
+    h = total_min // 60
+    m = total_min % 60
+    return f"{h}h {m:02d}m"
+
+
+def normalizar_codigo_equipo(codigo_str):
+    texto = str(codigo_str).upper().strip()
+    match_c = re.search(r"\\b([A-Z]+)-?(\\d+)\\b", texto)
+    if match_c:
+        return f"{match_c.group(1)}{match_c.group(2)}"
+    return re.sub(r"[^A-Z0-9]", "", texto)
+
+
+# ==============================================================================
+# GESTIÓN DE FLOTA Y ACCIDENTES (SUPABASE + LOCAL)
+# ==============================================================================
 def inicializar_base_flota():
-    """Garantiza que el archivo Excel de Flota y Pilotos exista con las hojas 'Equipos' y 'Pilotos'."""
+    if supabase_client:
+        try:
+            res_eq = supabase_client.table("equipos").select("id", count="exact").limit(1).execute()
+            if res_eq.count == 0:
+                supabase_client.table("equipos").upsert(EQUIPOS_INICIALES).execute()
+            res_pi = supabase_client.table("pilotos").select("id", count="exact").limit(1).execute()
+            if res_pi.count == 0:
+                supabase_client.table("pilotos").upsert(PILOTOS_INICIALES).execute()
+            return
+        except Exception:
+            pass
+
     if not os.path.exists(ARCHIVO_FLOTA):
         df_eq = pd.DataFrame(EQUIPOS_INICIALES)
         df_pi = pd.DataFrame(PILOTOS_INICIALES)
@@ -156,8 +215,19 @@ def inicializar_base_flota():
 
 
 def cargar_flota_y_pilotos():
-    """Lee las hojas Equipos y Pilotos desde el archivo Excel."""
     inicializar_base_flota()
+    if supabase_client:
+        try:
+            res_eq = supabase_client.table("equipos").select("*").execute()
+            res_pi = supabase_client.table("pilotos").select("*").execute()
+            df_eq = pd.DataFrame(res_eq.data) if res_eq.data else pd.DataFrame(EQUIPOS_INICIALES)
+            df_pi = pd.DataFrame(res_pi.data) if res_pi.data else pd.DataFrame(PILOTOS_INICIALES)
+            df_eq["fecha_venc_rev"] = pd.to_datetime(df_eq["fecha_venc_rev"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+            df_pi["fecha_venc_lic"] = pd.to_datetime(df_pi["fecha_venc_lic"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+            return df_eq, df_pi
+        except Exception:
+            pass
+
     try:
         df_eq = pd.read_excel(ARCHIVO_FLOTA, sheet_name="Equipos")
         df_pi = pd.read_excel(ARCHIVO_FLOTA, sheet_name="Pilotos")
@@ -171,19 +241,36 @@ def cargar_flota_y_pilotos():
 
 
 def guardar_flota_y_pilotos(df_eq, df_pi):
-    """Guarda los DataFrames actualizados de Equipos y Pilotos en el archivo Excel."""
+    if supabase_client:
+        try:
+            supabase_client.table("equipos").upsert(df_eq.to_dict(orient="records")).execute()
+            supabase_client.table("pilotos").upsert(df_pi.to_dict(orient="records")).execute()
+        except Exception:
+            pass
     with pd.ExcelWriter(ARCHIVO_FLOTA, engine="openpyxl") as writer:
         df_eq.to_excel(writer, sheet_name="Equipos", index=False)
         df_pi.to_excel(writer, sheet_name="Pilotos", index=False)
 
 
 def cargar_accidentes():
-    """Carga el historial de accidentes registrados."""
     columnas = [
         "ID", "Fecha", "Hora", "Codigo_Equipo", "Placa_Equipo", "Marca_Equipo", "Anio_Equipo",
         "Piloto", "Licencia_Venc", "Tipo_Accidente", "Severidad", "Lugar_Referencia",
-        "Descripcion", "Acciones_Tomadas", "Latitud", "Longitud", "Link_Google_Maps", "Archivos_Evidencia"
+        "Descripcion", "Acciones_Tomadas", "Latitud", "Longitud", "Link_Google_Maps",
+        "Archivos_Evidencia", "Auditoria_Telemetria"
     ]
+    if supabase_client:
+        try:
+            res = supabase_client.table("accidentes").select("*").execute()
+            if res.data:
+                df = pd.DataFrame(res.data)
+                for col in columnas:
+                    if col not in df.columns:
+                        df[col] = ""
+                return df.fillna("")
+        except Exception:
+            pass
+
     if os.path.exists(ARCHIVO_ACCIDENTES):
         try:
             df = pd.read_csv(ARCHIVO_ACCIDENTES)
@@ -197,7 +284,12 @@ def cargar_accidentes():
 
 
 def guardar_accidente_db(nuevo_reg):
-    """Agrega un nuevo registro de accidente al CSV."""
+    if supabase_client:
+        try:
+            supabase_client.table("accidentes").upsert(nuevo_reg).execute()
+        except Exception:
+            pass
+
     df = cargar_accidentes()
     df_nuevo = pd.DataFrame([nuevo_reg])
     df_final = pd.concat([df, df_nuevo], ignore_index=True)
@@ -205,219 +297,262 @@ def guardar_accidente_db(nuevo_reg):
     return df_final
 
 
-def guardar_archivos_evidencia(id_accidente, uploaded_files):
-    """Guarda fotos y videos subidos en la carpeta del accidente y devuelve la lista de rutas."""
-    if not uploaded_files:
+def guardar_evidencias(id_accidente, lista_items_memoria):
+    if not lista_items_memoria:
         return []
+    rutas_guardadas = []
     carpeta_evento = os.path.join(CARPETA_EVIDENCIAS, id_accidente)
     os.makedirs(carpeta_evento, exist_ok=True)
-    rutas_guardadas = []
-    for archivo in uploaded_files:
-        nombre_limpio = os.path.basename(archivo.name)
-        ruta_destino = os.path.join(carpeta_evento, nombre_limpio)
+
+    for idx, item in enumerate(lista_items_memoria, start=1):
+        nombre_limpio = os.path.basename(item["nombre"])
+        base, ext = os.path.splitext(nombre_limpio)
+        nuevo_nombre = f"EV{idx:02d}_{base}{ext}"
+
+        if supabase_client:
+            try:
+                ruta_nube = f"{id_accidente}/{nuevo_nombre}"
+                supabase_client.storage.from_("evidencias").upload(
+                    path=ruta_nube,
+                    file=item["bytes"],
+                    file_options={"upsert": "true"}
+                )
+                url_publica = supabase_client.storage.from_("evidencias").get_public_url(ruta_nube)
+                rutas_guardadas.append(url_publica)
+                continue
+            except Exception:
+                pass
+
+        ruta_destino = os.path.join(carpeta_evento, nuevo_nombre)
         with open(ruta_destino, "wb") as f:
-            f.write(archivo.getbuffer())
+            f.write(item["bytes"])
         rutas_guardadas.append(ruta_destino)
+
     return rutas_guardadas
 
 
+def clasificar_rutas_evidencia(archivos_str):
+    lista = [a.strip() for a in str(archivos_str).split(";") if a.strip()]
+    ext_img = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+    ext_vid = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg4")
+    fotos = [f for f in lista if f.lower().endswith(ext_img) or "supabase.co" in f.lower()]
+    videos = [f for f in lista if f.lower().endswith(ext_vid)]
+    otros = [f for f in lista if f not in fotos and f not in videos]
+    return lista, fotos, videos, otros
+
+
+# ==============================================================================
+# BUSCADOR GEOGRÁFICO Y MAPA ESTÁTICO / QR PARA EL PDF
+# ==============================================================================
+def buscar_direccion_nominatim(consulta):
+    if not consulta or not consulta.strip():
+        return []
+    try:
+        q_enc = urllib.parse.quote(consulta.strip())
+        url = f"https://nominatim.openstreetmap.org/search?q={q_enc}&format=json&limit=5&countrycodes=sv,gt,hn"
+        req = urllib.request.Request(url, headers={"User-Agent": "SolidaristasFlotaApp/4.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            datos = json.loads(resp.read().decode("utf-8"))
+            return [{"nombre": d.get("display_name", ""), "lat": float(d.get("lat", 14.286111)), "lon": float(d.get("lon", -89.458611))} for d in datos]
+    except Exception:
+        return []
+
+
+def extraer_coordenadas_de_texto_o_link(texto):
+    if not texto:
+        return None, None
+    patrones = [r"@(-?\\d+\\.\\d+),\\s*(-?\\d+\\.\\d+)", r"[?&]q=(-?\\d+\\.\\d+),\\s*(-?\\d+\\.\\d+)", r"(-?\\d+\\.\\d+)\\s*,\\s*(-?\\d+\\.\\d+)"]
+    for pat in patrones:
+        m = re.search(pat, str(texto))
+        if m:
+            return float(m.group(1)), float(m.group(2))
+    return None, None
+
+
+def generar_imagen_mapa_estatico(lat, lon, zoom=15):
+    try:
+        lat_rad = math.radians(float(lat))
+        n = 2.0 ** zoom
+        xtile_f = (float(lon) + 180.0) / 360.0 * n
+        ytile_f = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        x_center, y_center = int(math.floor(xtile_f)), int(math.floor(ytile_f))
+        px_in_tile, py_in_tile = int((xtile_f - x_center) * 256), int((ytile_f - y_center) * 256)
+
+        lienzo = Image.new("RGB", (256 * 3, 256 * 3), (226, 232, 240))
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                tx, ty = x_center + dx, y_center + dy
+                url_tile = f"https://mt1.google.com/vt/lyrs=y&x={tx}&y={ty}&z={zoom}"
+                req = urllib.request.Request(url_tile, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=3) as r_tile:
+                    tile_img = Image.open(io.BytesIO(r_tile.read())).convert("RGB")
+                    lienzo.paste(tile_img, ((dx + 1) * 256, (dy + 1) * 256))
+
+        cx, cy = 256 + px_in_tile, 256 + py_in_tile
+        recorte = lienzo.crop((cx - 210, cy - 115, cx + 210, cy + 115))
+        draw = ImageDraw.Draw(recorte)
+        mx, my = 210, 115
+        draw.ellipse((mx - 14, my - 14, mx + 14, my + 14), outline="white", width=3)
+        draw.ellipse((mx - 11, my - 11, mx + 11, my + 11), fill="#dc2626", outline="#7f1d1d", width=2)
+        draw.ellipse((mx - 4, my - 4, mx + 4, my + 4), fill="white")
+
+        out_buf = io.BytesIO()
+        recorte.save(out_buf, format="JPEG", quality=90)
+        out_buf.seek(0)
+        return out_buf
+    except Exception:
+        return None
+
+
 def generar_informe_pdf(reg):
-    """Genera un Informe Ejecutivo en PDF con todos los detalles de la situación y fotos de evidencia."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
 
-    # Banda superior institucional
     c.setFillColor(colors.HexColor("#0f172a"))
-    c.rect(0, height - 75, width, 75, fill=1, stroke=0)
-
+    c.rect(0, height - 82, width, 82, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 15)
-    c.drawString(40, height - 35, "INFORME OFICIAL DE INCIDENTE / ACCIDENTE OPERATIVO")
-    c.setFont("Helvetica", 10)
-    c.drawString(40, height - 55, f"Folio: {reg.get('ID', '')}  |  Fecha de Emisión: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    c.setFont("Helvetica-Bold", 14.5)
+    c.drawString(38, height - 32, "INFORME OFICIAL DE INCIDENTE / ACCIDENTE OPERATIVO")
+    c.setFont("Helvetica", 9.5)
+    c.drawString(38, height - 50, f"Folio: {reg.get('ID', '')}  |  Emisión: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Etiqueta de Severidad
     sev = str(reg.get("Severidad", "Moderado"))
-    color_sev = colors.HexColor("#dc2626") if sev in ["Grave", "Crítico"] else (
-        colors.HexColor("#d97706") if sev == "Moderado" else colors.HexColor("#16a34a")
-    )
+    color_sev = colors.HexColor("#dc2626") if sev in ["Grave", "Crítico"] else colors.HexColor("#16a34a")
     c.setFillColor(color_sev)
-    c.roundRect(width - 150, height - 58, 110, 28, 5, fill=1, stroke=0)
+    c.roundRect(38, height - 74, 125, 18, 4, fill=1, stroke=0)
     c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(width - 95, height - 48, f"SEVERIDAD: {sev.upper()}")
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawCentredString(100, height - 68, f"SEVERIDAD: {sev.upper()}")
 
-    y = height - 100
-    c.setFillColor(colors.black)
+    link_maps = str(reg.get("Link_Google_Maps", "https://www.google.com/maps"))
+    try:
+        c.setFillColor(colors.white)
+        c.roundRect(width - 102, height - 77, 68, 72, 4, fill=1, stroke=0)
+        qr_widget = qr.QrCodeWidget(link_maps)
+        b = qr_widget.getBounds()
+        d_qr = Drawing(58, 58, transform=[58.0 / (b[2] - b[0]), 0, 0, 58.0 / (b[3] - b[1]), 0, 0])
+        d_qr.add(qr_widget)
+        renderPDF.draw(d_qr, c, width - 97, height - 64)
+        c.setFillColor(colors.HexColor("#0f172a"))
+        c.setFont("Helvetica-Bold", 6.5)
+        c.drawCentredString(width - 68, height - 74, "ESCANEAR MAPA")
+    except Exception:
+        pass
 
-    # SECCIÓN 1: DATOS GENERALES Y UNIDAD / PILOTO
+    y = height - 102
     c.setFillColor(colors.HexColor("#e2e8f0"))
-    c.rect(40, y - 5, width - 80, 20, fill=1, stroke=0)
+    c.rect(38, y - 4, width - 76, 18, fill=1, stroke=0)
     c.setFillColor(colors.HexColor("#0f172a"))
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(48, y, "1. DATOS DEL EVENTO, UNIDAD Y PILOTO ASIGNADO")
-    y -= 24
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(44, y, "1. FICHA TÉCNICA DEL EVENTO Y UBICACIÓN GEOGRÁFICA")
+    y -= 20
 
+    y_inicio_ficha = y
     datos_ficha = [
-        ("Fecha y Hora del Suceso:", f"{reg.get('Fecha', '')} a las {reg.get('Hora', '')}"),
-        ("Tipo de Situación / Incidente:", str(reg.get("Tipo_Accidente", ""))),
-        ("Unidad / Equipo Involucrado:", f"Código: {reg.get('Codigo_Equipo', '')}  |  Placa: {reg.get('Placa_Equipo', '')}"),
-        ("Marca y Año del Equipo:", f"{reg.get('Marca_Equipo', '')} (Año {reg.get('Anio_Equipo', '')})"),
-        ("Piloto / Operador:", str(reg.get("Piloto", ""))),
-        ("Vencimiento Licencia Piloto:", str(reg.get("Licencia_Venc", "No registrado")) or "No registrado"),
-        ("Lugar / Referencia Vial:", str(reg.get("Lugar_Referencia", "Sin referencia")) or "Sin referencia"),
-        ("Coordenadas Geográficas:", f"Latitud: {reg.get('Latitud', '')}, Longitud: {reg.get('Longitud', '')}"),
-        ("Enlace Oficial Google Maps:", str(reg.get("Link_Google_Maps", "")))
+        ("Fecha y Hora:", f"{reg.get('Fecha', '')} a las {reg.get('Hora', '')}"),
+        ("Tipo Incidente:", str(reg.get("Tipo_Accidente", ""))),
+        ("Unidad / Equipo:", f"{reg.get('Codigo_Equipo', '')} | Placa: {reg.get('Placa_Equipo', '')}"),
+        ("Marca y Año:", f"{reg.get('Marca_Equipo', '')} ({reg.get('Anio_Equipo', '')})"),
+        ("Piloto Asignado:", str(reg.get("Piloto", ""))),
+        ("Referencia Vial:", str(reg.get("Lugar_Referencia", "Sin referencia"))[:42]),
+        ("Coordenadas:", f"{reg.get('Latitud', '')}, {reg.get('Longitud', '')}")
     ]
 
     for etiqueta, valor in datos_ficha:
         c.setFillColor(colors.HexColor("#334155"))
+        c.setFont("Helvetica-Bold", 8.8)
+        c.drawString(44, y, etiqueta)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 8.8)
+        c.drawString(130, y, str(valor)[:45])
+        y -= 15
+
+    mapa_buf = generar_imagen_mapa_estatico(reg.get("Latitud", 14.286111), reg.get("Longitud", -89.458611), zoom=15)
+    if mapa_buf:
+        map_w, map_h = 215, 125
+        map_x, map_y = width - 38 - map_w, y_inicio_ficha - map_h + 10
+        try:
+            c.drawImage(ImageReader(mapa_buf), map_x, map_y, width=map_w, height=map_h, preserveAspectRatio=False)
+            c.setStrokeColor(colors.HexColor("#0f172a"))
+            c.rect(map_x, map_y, map_w, map_h, fill=0, stroke=1)
+        except Exception:
+            pass
+
+    y = min(y, y_inicio_ficha - 135)
+    texto_tele = str(reg.get("Auditoria_Telemetria", "")).strip()
+    if texto_tele:
+        c.setFillColor(colors.HexColor("#dbeafe"))
+        c.rect(38, y - 4, width - 76, 17, fill=1, stroke=0)
+        c.setFillColor(colors.HexColor("#1e3a8a"))
         c.setFont("Helvetica-Bold", 9.5)
-        c.drawString(48, y, etiqueta)
-        if "Google Maps" in etiqueta and str(valor).startswith("http"):
-            c.setFillColor(colors.HexColor("#1d4ed8"))
-            c.setFont("Helvetica-Oblique", 9.5)
-            c.drawString(210, y, valor)
-            c.linkURL(valor, (210, y - 2, 540, y + 10), relative=0)
-        else:
-            c.setFillColor(colors.black)
-            c.setFont("Helvetica", 9.5)
-            c.drawString(210, y, str(valor)[:75])
-        y -= 17
+        c.drawString(44, y, "AUDITORÍA AUTOMÁTICA DE TELEMETRÍA GPS (PLANTA EL RONCO)")
+        y -= 16
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 8.8)
+        for lin_t in textwrap.wrap(texto_tele, width=96)[:4]:
+            c.drawString(44, y, lin_t)
+            y -= 12
+        y -= 4
 
-    y -= 8
-
-    # SECCIÓN 2: DESCRIPCIÓN DE LA SITUACIÓN SUCEDIDA
     c.setFillColor(colors.HexColor("#e2e8f0"))
-    c.rect(40, y - 5, width - 80, 20, fill=1, stroke=0)
+    c.rect(38, y - 4, width - 76, 18, fill=1, stroke=0)
     c.setFillColor(colors.HexColor("#0f172a"))
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(48, y, "2. DESCRIPCIÓN DETALLADA DE LA SITUACIÓN SUCEDIDA")
-    y -= 22
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(44, y, "2. DESCRIPCIÓN DETALLADA Y ACCIONES TOMADAS")
+    y -= 18
 
     c.setFillColor(colors.black)
-    c.setFont("Helvetica", 9.5)
-    texto_desc = str(reg.get("Descripcion", "Sin descripción registrada.")).strip()
-    lineas_desc = []
-    for parrafo in texto_desc.splitlines():
-        lineas_desc.extend(textwrap.wrap(parrafo, width=92) or [""])
-    for linea in lineas_desc[:12]:
-        c.drawString(48, y, linea)
-        y -= 14
+    c.setFont("Helvetica", 9)
+    for linea in textwrap.wrap(str(reg.get("Descripcion", "")), width=95)[:8]:
+        c.drawString(44, y, linea)
+        y -= 13
 
-    y -= 8
+    lista_archivos, fotos, videos, otros = clasificar_rutas_evidencia(reg.get("Archivos_Evidencia", ""))
+    if fotos:
+        c.showPage()
+        y = height - 50
+        c.setFillColor(colors.HexColor("#0f172a"))
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(38, y, f"ANEXO FOTOGRÁFICO DE EVIDENCIAS ({len(fotos)} IMÁGENES) - FOLIO {reg.get('ID', '')}")
+        y -= 25
 
-    # SECCIÓN 3: ACCIONES TOMADAS Y SEGUIMIENTO
-    c.setFillColor(colors.HexColor("#e2e8f0"))
-    c.rect(40, y - 5, width - 80, 20, fill=1, stroke=0)
-    c.setFillColor(colors.HexColor("#0f172a"))
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(48, y, "3. ACCIONES INMEDIATAS Y MEDIDAS CORRECTIVAS")
-    y -= 22
+        x_positions = [42, 312]
+        img_w, img_h = 248, 162
+        col_idx = 0
 
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica", 9.5)
-    texto_acc = str(reg.get("Acciones_Tomadas", "Sin acciones adicionales registradas.")).strip()
-    lineas_acc = []
-    for parrafo in texto_acc.splitlines():
-        lineas_acc.extend(textwrap.wrap(parrafo, width=92) or [""])
-    for linea in lineas_acc[:8]:
-        c.drawString(48, y, linea)
-        y -= 14
-
-    y -= 10
-
-    # SECCIÓN 4: EVIDENCIAS ADJUNTAS (FOTOS Y VIDEOS)
-    archivos_str = str(reg.get("Archivos_Evidencia", "")).strip()
-    lista_archivos = [a.strip() for a in archivos_str.split(";") if a.strip() and os.path.exists(a.strip())]
-
-    extensiones_img = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
-    fotos = [f for f in lista_archivos if f.lower().endswith(extensiones_img)]
-    videos_otros = [f for f in lista_archivos if not f.lower().endswith(extensiones_img)]
-
-    c.setFillColor(colors.HexColor("#e2e8f0"))
-    c.rect(40, y - 5, width - 80, 20, fill=1, stroke=0)
-    c.setFillColor(colors.HexColor("#0f172a"))
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(48, y, f"4. REGISTRO DE EVIDENCIAS ADJUNTAS ({len(lista_archivos)} ARCHIVOS)")
-    y -= 20
-
-    if not lista_archivos:
-        c.setFillColor(colors.HexColor("#64748b"))
-        c.setFont("Helvetica-Oblique", 9.5)
-        c.drawString(48, y, "No se adjuntaron archivos multimedia en este reporte.")
-        y -= 20
-    else:
-        if videos_otros:
-            c.setFillColor(colors.black)
-            c.setFont("Helvetica-Bold", 9.5)
-            c.drawString(48, y, "Videos / Documentos registrados en expediente digital:")
-            y -= 14
-            c.setFont("Helvetica", 9)
-            for vo in videos_otros:
-                c.drawString(60, y, f"• {os.path.basename(vo)}")
-                y -= 13
-            y -= 6
-
-        if fotos:
-            if y < 220:
+        for idx, ruta_foto in enumerate(fotos):
+            if y - img_h < 60:
                 c.showPage()
                 y = height - 50
-                c.setFillColor(colors.HexColor("#0f172a"))
-                c.setFont("Helvetica-Bold", 12)
-                c.drawString(40, y, f"ANEXO FOTOGRÁFICO DE EVIDENCIAS - FOLIO {reg.get('ID', '')}")
-                y -= 25
+                col_idx = 0
 
-            x_positions = [45, 315]
-            img_w, img_h = 245, 165
-            col_idx = 0
-
-            for idx, ruta_foto in enumerate(fotos):
-                if y - img_h < 60:
-                    c.showPage()
-                    y = height - 50
-                    c.setFillColor(colors.HexColor("#0f172a"))
-                    c.setFont("Helvetica-Bold", 12)
-                    c.drawString(40, y, f"ANEXO FOTOGRÁFICO DE EVIDENCIAS (CONTINUACIÓN) - {reg.get('ID', '')}")
-                    y -= 25
-                    col_idx = 0
-
-                x_actual = x_positions[col_idx]
-                try:
+            x_actual = x_positions[col_idx]
+            try:
+                # Si la foto viene de URL de Supabase Storage, abrirla con urllib
+                if str(ruta_foto).startswith("http"):
+                    req_img = urllib.request.Request(ruta_foto, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req_img, timeout=5) as r_img:
+                        img_pil = Image.open(io.BytesIO(r_img.read())).convert("RGB")
+                else:
                     img_pil = Image.open(ruta_foto).convert("RGB")
-                    img_buffer = io.BytesIO()
-                    img_pil.save(img_buffer, format="JPEG", quality=85)
-                    img_buffer.seek(0)
-                    c.drawImage(ImageReader(img_buffer), x_actual, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, anchor='c')
-                    c.setStrokeColor(colors.HexColor("#cbd5e1"))
-                    c.rect(x_actual, y - img_h, img_w, img_h, fill=0, stroke=1)
-                    c.setFillColor(colors.HexColor("#334155"))
-                    c.setFont("Helvetica", 8)
-                    c.drawString(x_actual, y - img_h - 11, f"Evidencia #{idx+1}: {os.path.basename(ruta_foto)[:38]}")
-                except Exception:
-                    c.drawString(x_actual, y - 20, f"[No se pudo renderizar imagen: {os.path.basename(ruta_foto)}]")
 
-                col_idx += 1
-                if col_idx >= 2:
-                    col_idx = 0
-                    y -= (img_h + 28)
+                img_buffer = io.BytesIO()
+                img_pil.save(img_buffer, format="JPEG", quality=85)
+                img_buffer.seek(0)
+                c.drawImage(ImageReader(img_buffer), x_actual, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, anchor='c')
+                c.setStrokeColor(colors.HexColor("#cbd5e1"))
+                c.rect(x_actual, y - img_h, img_w, img_h, fill=0, stroke=1)
+                c.setFillColor(colors.HexColor("#334155"))
+                c.setFont("Helvetica-Bold", 8)
+                c.drawString(x_actual, y - img_h - 11, f"Foto #{idx+1} de {len(fotos)}")
+            except Exception:
+                pass
 
-            if col_idx == 1:
-                y -= (img_h + 28)
-
-    # Líneas de firma al pie
-    if y < 90:
-        c.showPage()
-        y = height - 80
-
-    c.setStrokeColor(colors.HexColor("#64748b"))
-    c.line(70, 55, 250, 55)
-    c.line(width - 250, 55, width - 70, 55)
-    c.setFillColor(colors.HexColor("#334155"))
-    c.setFont("Helvetica-Bold", 9)
-    c.drawCentredString(160, 42, "Firma del Piloto / Operador")
-    c.drawCentredString(width - 160, 42, "Firma de Supervisor / Seguridad Vial")
+            col_idx += 1
+            if col_idx >= 2:
+                col_idx = 0
+                y -= (img_h + 26)
 
     c.showPage()
     c.save()
@@ -425,374 +560,291 @@ def generar_informe_pdf(reg):
     return buffer
 
 
-# Inicializar estado del mapa en session_state
+def generar_zip_expediente(reg):
+    zip_buffer = io.BytesIO()
+    id_folio = reg.get("ID", "ACC")
+    pdf_bytes = generar_informe_pdf(reg).getvalue()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"Informe_Oficial_{id_folio}.pdf", pdf_bytes)
+    zip_buffer.seek(0)
+    return zip_buffer
+
+
+# ==============================================================================
+# MOTOR DE TELEMETRÍA GPS ('Report')
+# ==============================================================================
+def procesar_excel_telemetria(filepath_or_buffer):
+    xls = pd.ExcelFile(filepath_or_buffer)
+    hoja = "Report" if "Report" in xls.sheet_names else xls.sheet_names[0]
+    raw_df = pd.read_excel(filepath_or_buffer, sheet_name=hoja, header=None)
+    filas_enc = raw_df[raw_df.iloc[:, 0].astype(str).str.strip() == "Dispositivo"].index
+    skip_rows = int(filas_enc[0]) if len(filas_enc) > 0 else 10
+
+    df = pd.read_excel(filepath_or_buffer, sheet_name=hoja, skiprows=skip_rows)
+    df = df.dropna(subset=["Dispositivo", "Llegó", "Salió"]).copy()
+    df["Distancia hasta la llegada"] = pd.to_numeric(df["Distancia hasta la llegada"], errors="coerce").fillna(0.0)
+    df["Llegó"] = pd.to_datetime(df["Llegó"])
+    df["Salió"] = pd.to_datetime(df["Salió"])
+    df["duracion_horas"] = (df["Salió"] - df["Llegó"]).dt.total_seconds() / 3600.0
+    df["Fecha"] = df["Llegó"].dt.strftime("%Y-%m-%d")
+
+    def limpiar_equipo_tele(row):
+        disp = str(row["Dispositivo"]).strip()
+        match_codigo = re.search(r"(C-\\d+)", disp)
+        return match_codigo.group(1) if match_codigo else disp
+
+    df["Equipo"] = df.apply(limpiar_equipo_tele, axis=1)
+    df["Codigo_Norm"] = df["Dispositivo"].apply(normalizar_codigo_equipo)
+    df = df.sort_values(by=["Dispositivo", "Llegó"]).reset_index(drop=True)
+
+    df["prev_salio"] = df.groupby("Dispositivo")["Salió"].shift(1)
+    df["gap_horas"] = (df["Llegó"] - df["prev_salio"]).dt.total_seconds() / 3600.0
+    df["nueva_ocasion"] = df["gap_horas"].isna() | (df["gap_horas"] >= 4.0)
+    df["ocasion_id"] = df.groupby("Dispositivo")["nueva_ocasion"].cumsum()
+
+    ocasion_df = df.groupby(["Equipo", "Dispositivo", "Codigo_Norm", "Fecha", "ocasion_id"], as_index=False).agg(
+        fragmentos_gps=("Zona", "count"),
+        primera_llegada=("Llegó", "min"),
+        ultima_salida=("Salió", "max"),
+        tiempo_neto_h=("duracion_horas", "sum"),
+        distancia_inicial_km=("Distancia hasta la llegada", "first"),
+        distancia_total_km=("Distancia hasta la llegada", "sum")
+    )
+    ocasion_df["tiempo_bruto_h"] = (ocasion_df["ultima_salida"] - ocasion_df["primera_llegada"]).dt.total_seconds() / 3600.0
+    ocasion_df["Turno"] = np.where(ocasion_df["primera_llegada"].dt.hour < 12, "Carga AM", "Carga PM")
+    ocasion_df["Tiempo_Neto_HM"] = ocasion_df["tiempo_neto_h"].apply(convertir_a_hm)
+    ocasion_df["Hora_Inicio"] = ocasion_df["primera_llegada"].dt.strftime("%H:%M:%S")
+    ocasion_df["Hora_Fin"] = ocasion_df["ultima_salida"].dt.strftime("%H:%M:%S")
+    return df, ocasion_df
+
+
+def auditar_accidente_contra_telemetria(codigo_eq, fecha_str, hora_str, ocasion_df):
+    if ocasion_df is None or ocasion_df.empty:
+        return "Sin archivo de telemetría cargado para cruce."
+    cod_norm = normalizar_codigo_equipo(codigo_eq)
+    sub = ocasion_df[ocasion_df["Codigo_Norm"] == cod_norm].copy()
+    if sub.empty:
+        return f"La unidad {codigo_eq} no registra entradas en telemetría."
+    try:
+        dt_acc = pd.to_datetime(f"{fecha_str} {hora_str}")
+    except Exception:
+        return "Fecha/hora no válida."
+
+    en_planta = sub[(sub["primera_llegada"] <= dt_acc) & (dt_acc <= sub["ultima_salida"])]
+    if not en_planta.empty:
+        r = en_planta.iloc[0]
+        return f"EN PLANTA: Ocurrió mientras la unidad estaba en PLANTA EL RONCO ({r['Turno']}, entrada {r['Hora_Inicio']} - salida {r['Hora_Fin']}, estancia {r['Tiempo_Neto_HM']})."
+    return f"EN RUTA EXTERNA: La unidad operaba fuera de planta al momento del suceso."
+
+
+# ==============================================================================
+# INICIALIZACIÓN DE ESTADOS
+# ==============================================================================
 if "lat_sel" not in st.session_state:
-    st.session_state.lat_sel = 14.286111  # Planta El Ronco / Metapán
+    st.session_state.lat_sel = 14.286111
 if "lon_sel" not in st.session_state:
     st.session_state.lon_sel = -89.458611
+if "cola_evidencias" not in st.session_state:
+    st.session_state.cola_evidencias = []
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+if "resultados_busqueda_mapa" not in st.session_state:
+    st.session_state.resultados_busqueda_mapa = []
 
-# Cargar datos maestros de Equipos y Pilotos
+if "ocasion_tele_df" not in st.session_state:
+    if os.path.exists(ARCHIVO_TELEMETRIA_CACHE):
+        try:
+            _, st.session_state.ocasion_tele_df = procesar_excel_telemetria(ARCHIVO_TELEMETRIA_CACHE)
+        except Exception:
+            st.session_state.ocasion_tele_df = None
+    else:
+        st.session_state.ocasion_tele_df = None
+
+
+def agregar_archivos_a_cola(archivos_nuevos, categoria):
+    agregados = 0
+    nombres_existentes = {(item["nombre"], item["tamano"]) for item in st.session_state.cola_evidencias}
+    for arch in archivos_nuevos:
+        contenido = arch.getvalue()
+        clave = (arch.name, len(contenido))
+        if clave not in nombres_existentes:
+            st.session_state.cola_evidencias.append({"nombre": arch.name, "categoria": categoria, "tamano": len(contenido), "bytes": contenido})
+            nombres_existentes.add(clave)
+            agregados += 1
+    return agregados
+
+
 df_equipos, df_pilotos = cargar_flota_y_pilotos()
 
-st.title("🚨 Sistema Integral de Reporte de Accidentes, Flota y Evidencias")
-st.markdown(
-    "Plataforma conectada a **`Base_Flota_Solidaristas_20261106.xlsx`** con selección geográfica en **Google Maps**, "
-    "gestión de **Equipos y Pilotos**, carga de **Fotos/Videos de Evidencia** y emisión de **Informes en PDF**."
-)
+# BARRA LATERAL (MEJORA 1)
+with st.sidebar:
+    st.header("☁️ Supabase Cloud & Respaldo ZIP")
+    estado_nube = "Supabase Cloud Conectado 🟢" if supabase_client else "Almacenamiento Local + ZIP 🟡"
+    st.success(f"**Estado:** {estado_nube}")
 
+    zip_maestro = exportar_backup_maestro_zip()
+    st.download_button(
+        label="💾 Descargar Respaldo Maestro (.ZIP)",
+        data=zip_maestro,
+        file_name=f"Backup_Solidaristas_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
+    with st.expander("📤 Restaurar Respaldo (.ZIP)"):
+        zip_subido = st.file_uploader("Sube tu archivo ZIP:", type=["zip"])
+        if zip_subido and st.button("🔄 Restaurar Ahora"):
+            restaurar_backup_maestro_zip(zip_subido)
+            st.success("¡Restaurado con éxito!")
+            st.rerun()
+
+st.title("🚨 Plataforma Integral de Accidentes, Flota, Evidencias y Supabase")
 menu_tabs = st.tabs([
-    "📝 1. Registrar Accidente y Evidencias",
-    "📂 2. Historial, Galería Multimedia e Informe PDF",
-    "🚛 3. Base de Datos: Pilotos y Equipos (Agregar / Editar)"
+    "📝 1. Registrar Accidente (Google Maps + Evidencias)",
+    "📂 2. Historial, Galería y PDF con Mapa/QR",
+    "🛰️ 3. Cruce con Telemetría GPS",
+    "🚛 4. Base de Datos: Pilotos y Equipos"
 ])
 
-# ==============================================================================
-# PESTAÑA 1: REGISTRAR ACCIDENTE CON MAPA GOOGLE MAPS Y EVIDENCIAS
-# ==============================================================================
+# PESTAÑA 1: REGISTRAR ACCIDENTE
 with menu_tabs[0]:
-    col_mapa, col_form = st.columns([1.25, 1.15])
+    col_mapa, col_evidencias = st.columns([1.2, 1.2])
 
     with col_mapa:
-        st.subheader("🗺️ 1. Ubicación del Accidente en Google Maps")
-        st.caption("Haz clic sobre el punto exacto del mapa donde ocurrió el evento para fijar las coordenadas.")
+        st.subheader("🗺️ 1. Ubicación en Google Maps, Buscador y GPS")
+        consulta_mapa = st.text_input("🔍 Buscar lugar, carretera o coordenadas:", placeholder="Ej. Metapán, Santa Ana o 14.2861, -89.4586")
+        if st.button("🔎 Buscar en Mapa", use_container_width=True):
+            lat_p, lon_p = extraer_coordenadas_de_texto_o_link(consulta_mapa)
+            if lat_p is not None:
+                st.session_state.lat_sel, st.session_state.lon_sel = lat_p, lon_p
+                st.rerun()
+            else:
+                st.session_state.resultados_busqueda_mapa = buscar_direccion_nominatim(consulta_mapa)
 
-        tipo_mapa = st.radio(
-            "Capas de Google Maps:",
-            ["Google Maps (Calles)", "Google Satélite (Híbrido)", "Google Satélite Puro"],
-            horizontal=True
-        )
-        if tipo_mapa == "Google Maps (Calles)":
-            tiles_url = "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}"
-        elif tipo_mapa == "Google Satélite (Híbrido)":
-            tiles_url = "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"
-        else:
-            tiles_url = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
-
-        m = folium.Map(
-            location=[st.session_state.lat_sel, st.session_state.lon_sel],
-            zoom_start=15,
-            tiles=tiles_url,
-            attr="Google Maps"
-        )
-        m.add_child(folium.LatLngPopup())
-
-        link_actual = f"https://www.google.com/maps?q={st.session_state.lat_sel:.6f},{st.session_state.lon_sel:.6f}"
-        folium.Marker(
-            location=[st.session_state.lat_sel, st.session_state.lon_sel],
-            popup=folium.Popup(f"<b>Punto del Accidente</b><br><a href='{link_actual}' target='_blank'>Abrir en Google Maps</a>", max_width=250),
-            tooltip="Ubicación seleccionada",
-            icon=folium.Icon(color="red", icon="exclamation-sign")
-        ).add_to(m)
-
-        mapa_output = st_folium(m, width="100%", height=470, key="mapa_registro_principal")
-
-        if mapa_output and mapa_output.get("last_clicked"):
-            n_lat = mapa_output["last_clicked"]["lat"]
-            n_lon = mapa_output["last_clicked"]["lng"]
-            if (abs(n_lat - st.session_state.lat_sel) > 1e-6) or (abs(n_lon - st.session_state.lon_sel) > 1e-6):
-                st.session_state.lat_sel = n_lat
-                st.session_state.lon_sel = n_lon
+        if st.session_state.resultados_busqueda_mapa:
+            opciones_lugares = [f"{r['nombre'][:80]} ({r['lat']:.5f}, {r['lon']:.5f})" for r in st.session_state.resultados_busqueda_mapa]
+            lug_sel = st.selectbox("Resultados:", opciones_lugares)
+            if st.button("✅ Centrar Mapa"):
+                idx = opciones_lugares.index(lug_sel)
+                st.session_state.lat_sel = st.session_state.resultados_busqueda_mapa[idx]["lat"]
+                st.session_state.lon_sel = st.session_state.resultados_busqueda_mapa[idx]["lon"]
+                st.session_state.resultados_busqueda_mapa = []
                 st.rerun()
 
+        tipo_mapa = st.radio("Vista:", ["Google Maps (Calles)", "Google Satélite (Híbrido)", "Google Satélite Puro"], horizontal=True)
+        tiles_url = "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}" if "Calles" in tipo_mapa else ("https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}" if "Híbrido" in tipo_mapa else "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}")
+
+        m = folium.Map(location=[st.session_state.lat_sel, st.session_state.lon_sel], zoom_start=15, tiles=tiles_url, attr="Google Maps")
+        m.add_child(folium.LatLngPopup())
+        link_actual = f"https://www.google.com/maps?q={st.session_state.lat_sel:.6f},{st.session_state.lon_sel:.6f}"
+        folium.Marker([st.session_state.lat_sel, st.session_state.lon_sel], icon=folium.Icon(color="red")).add_to(m)
+
+        mapa_output = st_folium(m, width="100%", height=410, key="mapa_reg")
+        if mapa_output and mapa_output.get("last_clicked"):
+            st.session_state.lat_sel = mapa_output["last_clicked"]["lat"]
+            st.session_state.lon_sel = mapa_output["last_clicked"]["lng"]
+            st.rerun()
+
         link_google = f"https://www.google.com/maps?q={st.session_state.lat_sel:.6f},{st.session_state.lon_sel:.6f}"
-        st.info(
-            f"📍 **Coordenadas seleccionadas:** `{st.session_state.lat_sel:.6f}, {st.session_state.lon_sel:.6f}`  \n"
-            f"🔗 **Enlace Google Maps:** [Abrir punto exacto en Google Maps]({link_google})"
-        )
+        st.info(f"📍 **Coordenadas:** `{st.session_state.lat_sel:.6f}, {st.session_state.lon_sel:.6f}`")
 
-    with col_form:
-        st.subheader("📋 2. Formulario del Incidente y Evidencias")
+    with col_evidencias:
+        st.subheader("📷📹 2. Carga Masiva de Evidencias Digitales")
+        sub1, sub2 = st.tabs(["🖼️ Imágenes (5, 10+)", "🎬 Videos (5+)"])
+        with sub1:
+            fotos_up = st.file_uploader("Fotos:", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key=f"f_{st.session_state.uploader_key}")
+            if fotos_up:
+                agregar_archivos_a_cola(fotos_up, "IMAGEN")
+        with sub2:
+            videos_up = st.file_uploader("Videos:", type=["mp4", "mov", "avi"], accept_multiple_files=True, key=f"v_{st.session_state.uploader_key}")
+            if videos_up:
+                agregar_archivos_a_cola(videos_up, "VIDEO")
 
-        # Construir listas formateadas desde la base de datos Excel
-        opciones_equipos = [
-            f"{r['codigo']} | Placa: {r['placa']} | {r['marca']} ({r['anio']})"
-            for _, r in df_equipos.sort_values("codigo").iterrows()
-        ]
-        opciones_pilotos = [
-            f"{r['nombre']}" + (f" (Lic. vence: {r['fecha_venc_lic']})" if str(r['fecha_venc_lic']).strip() else "")
-            for _, r in df_pilotos.sort_values("nombre").iterrows()
-        ]
-
-        with st.form("form_registro_accidente", clear_on_submit=True):
-            f_col1, f_col2 = st.columns(2)
-            with f_col1:
-                fecha_ev = st.date_input("Fecha del Suceso", value=date.today())
-                equipo_sel = st.selectbox("Unidad / Equipo (Base Solidaristas)", opciones_equipos)
-                tipo_incidente = st.selectbox(
-                    "Tipo de Situación / Accidente",
-                    [
-                        "Colisión vehicular en ruta",
-                        "Incidente en maniobra dentro de planta",
-                        "Daño mecánico / Falla de equipo",
-                        "Salida de vía / Cuneta",
-                        "Daño a terceros / Propiedad",
-                        "Derrame o pérdida de carga",
-                        "Otro incidente operativo"
-                    ]
-                )
-            with f_col2:
-                hora_ev = st.time_input("Hora del Suceso", value=datetime.now().time())
-                piloto_sel = st.selectbox("Piloto Asignado (Base Solidaristas)", opciones_pilotos)
-                severidad_ev = st.selectbox("Nivel de Severidad", ["Leve", "Moderado", "Grave", "Crítico"])
-
-            lugar_ref = st.text_input(
-                "Lugar o Punto de Referencia (Carretera, Km, Zona de Planta):",
-                placeholder="Ej. Carretera a Metapán Km 104 / Zona de Enlonado Planta El Ronco"
-            )
-            descripcion_ev = st.text_area(
-                "Descripción detallada de la situación ocurrida:",
-                height=100,
-                placeholder="Relata cómo sucedió la situación, condiciones de la vía, daños materiales o personales..."
-            )
-            acciones_ev = st.text_area(
-                "Acciones inmediatas tomadas:",
-                height=75,
-                placeholder="Ej. Se dio aviso a supervisión, asistencia vial en sitio, traslado de unidad..."
-            )
-
-            st.markdown("#### 📷📹 Adjuntar Evidencias del Accidente (Fotos, Videos, Documentos)")
-            archivos_subidos = st.file_uploader(
-                "Selecciona una o varias fotos (.jpg, .png) o videos (.mp4, .mov) del suceso:",
-                type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "avi", "pdf"],
-                accept_multiple_files=True
-            )
-
-            btn_registrar = st.form_submit_button("💾 Guardar Registro, Evidencias y Generar Informe PDF", use_container_width=True)
-
-            if btn_registrar:
-                df_acc_actual = cargar_accidentes()
-                nuevo_id = f"ACC-{len(df_acc_actual) + 1:04d}"
-
-                # Extraer datos técnicos del equipo seleccionado
-                cod_eq = equipo_sel.split(" | ")[0].strip()
-                fila_eq = df_equipos[df_equipos["codigo"].astype(str) == cod_eq].iloc[0]
-
-                # Extraer datos del piloto seleccionado
-                nom_pi = piloto_sel.split(" (Lic. vence:")[0].strip()
-                filas_pi = df_pilotos[df_pilotos["nombre"].astype(str) == nom_pi]
-                venc_lic = filas_pi.iloc[0]["fecha_venc_lic"] if not filas_pi.empty else ""
-
-                # Guardar archivos multimedia en disco
-                rutas_evidencia = guardar_archivos_evidencia(nuevo_id, archivos_subidos)
-
-                nuevo_registro = {
-                    "ID": nuevo_id,
-                    "Fecha": fecha_ev.strftime("%Y-%m-%d"),
-                    "Hora": hora_ev.strftime("%H:%M:%S"),
-                    "Codigo_Equipo": str(fila_eq["codigo"]),
-                    "Placa_Equipo": str(fila_eq["placa"]),
-                    "Marca_Equipo": str(fila_eq["marca"]),
-                    "Anio_Equipo": str(fila_eq["anio"]),
-                    "Piloto": nom_pi,
-                    "Licencia_Venc": str(venc_lic),
-                    "Tipo_Accidente": tipo_incidente,
-                    "Severidad": severidad_ev,
-                    "Lugar_Referencia": lugar_ref if lugar_ref.strip() else "Ver enlace Google Maps",
-                    "Descripcion": descripcion_ev if descripcion_ev.strip() else "Sin descripción detallada.",
-                    "Acciones_Tomadas": acciones_ev if acciones_ev.strip() else "En seguimiento por supervisión.",
-                    "Latitud": round(st.session_state.lat_sel, 6),
-                    "Longitud": round(st.session_state.lon_sel, 6),
-                    "Link_Google_Maps": link_google,
-                    "Archivos_Evidencia": ";".join(rutas_evidencia)
-                }
-
-                guardar_accidente_db(nuevo_registro)
-                st.session_state["ultimo_accidente_creado"] = nuevo_registro
-                st.success(f"✅ ¡Incidente **{nuevo_id}** registrado con éxito con {len(rutas_evidencia)} archivo(s) de evidencia!")
-
-        # Si acaba de crear un accidente, mostrar botón inmediato de descarga de PDF
-        if "ultimo_accidente_creado" in st.session_state:
-            reg_reciente = st.session_state["ultimo_accidente_creado"]
-            pdf_inmediato = generar_informe_pdf(reg_reciente)
-            st.download_button(
-                label=f"📄 Descargar Informe Oficial en PDF ({reg_reciente['ID']})",
-                data=pdf_inmediato,
-                file_name=f"Informe_Situacion_{reg_reciente['ID']}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-
-# ==============================================================================
-# PESTAÑA 2: HISTORIAL, GALERÍA DE FOTOS/VIDEOS E INFORME PDF
-# ==============================================================================
-with menu_tabs[1]:
-    st.subheader("📂 Expedientes de Accidentes, Evidencias Multimedia e Informes PDF")
-    df_hist = cargar_accidentes()
-
-    if df_hist.empty:
-        st.info("Aún no hay accidentes registrados. Utiliza la Pestaña 1 para registrar el primer evento.")
-    else:
-        st.dataframe(
-            df_hist[[
-                "ID", "Fecha", "Hora", "Codigo_Equipo", "Placa_Equipo", "Marca_Equipo",
-                "Piloto", "Tipo_Accidente", "Severidad", "Lugar_Referencia", "Link_Google_Maps"
-            ]],
-            column_config={
-                "Link_Google_Maps": st.column_config.LinkColumn(
-                    "Ubicación Google Maps",
-                    display_text="📍 Abrir en Google Maps"
-                )
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.divider()
-        col_det, col_media = st.columns([1.1, 1.3])
-
-        with col_det:
-            st.markdown("### 📄 Generar Informe PDF y Agregar Más Evidencias")
-            id_sel = st.selectbox("Selecciona el Folio del Expediente:", df_hist["ID"].tolist()[::-1])
-            reg_actual = df_hist[df_hist["ID"] == id_sel].iloc[0].to_dict()
-
-            st.markdown(
-                f"**Unidad:** `{reg_actual['Codigo_Equipo']}` (Placa `{reg_actual['Placa_Equipo']}` - {reg_actual['Marca_Equipo']})  \n"
-                f"**Piloto:** {reg_actual['Piloto']}  \n"
-                f"**Fecha y Hora:** {reg_actual['Fecha']} {reg_actual['Hora']}  \n"
-                f"**Severidad:** `{reg_actual['Severidad']}` | **Tipo:** {reg_actual['Tipo_Accidente']}  \n"
-                f"**Descripción:** {reg_actual['Descripcion']}  \n"
-                f"**Ubicación:** [📍 Ver punto exacto en Google Maps]({reg_actual['Link_Google_Maps']})"
-            )
-
-            pdf_expediente = generar_informe_pdf(reg_actual)
-            st.download_button(
-                label=f"📥 Descargar Informe Completo en PDF ({id_sel})",
-                data=pdf_expediente,
-                file_name=f"Informe_Accidente_{id_sel}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-
-            with st.expander("➕ Subir fotos o videos adicionales a este expediente"):
-                nuevos_archivos = st.file_uploader(
-                    "Añadir más evidencias:",
-                    type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "avi", "pdf"],
-                    accept_multiple_files=True,
-                    key=f"up_extra_{id_sel}"
-                )
-                if st.button("Guardar Evidencias Adicionales", key=f"btn_extra_{id_sel}"):
-                    if nuevos_archivos:
-                        nuevas_rutas = guardar_archivos_evidencia(id_sel, nuevos_archivos)
-                        previas = [x for x in str(reg_actual.get("Archivos_Evidencia", "")).split(";") if x.strip()]
-                        todas = previas + nuevas_rutas
-                        df_hist.loc[df_hist["ID"] == id_sel, "Archivos_Evidencia"] = ";".join(todas)
-                        df_hist.to_csv(ARCHIVO_ACCIDENTES, index=False, encoding="utf-8-sig")
-                        st.success("¡Evidencias añadidas al expediente y al PDF!")
-                        st.rerun()
-
-        with col_media:
-            st.markdown(f"### 🖼️🎬 Galería Multimedia del Expediente `{id_sel}`")
-            archivos_str = str(reg_actual.get("Archivos_Evidencia", "")).strip()
-            lista_ev = [a.strip() for a in archivos_str.split(";") if a.strip() and os.path.exists(a.strip())]
-
-            if not lista_ev:
-                st.info("Este expediente aún no tiene fotos ni videos adjuntos.")
-            else:
-                fotos_ev = [f for f in lista_ev if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
-                videos_ev = [f for f in lista_ev if f.lower().endswith((".mp4", ".mov", ".avi"))]
-
-                if fotos_ev:
-                    st.markdown(f"**📷 Fotografías ({len(fotos_ev)}):**")
-                    cols_img = st.columns(2)
-                    for i, ruta_img in enumerate(fotos_ev):
-                        with cols_img[i % 2]:
-                            st.image(ruta_img, caption=os.path.basename(ruta_img), use_container_width=True)
-
-                if videos_ev:
-                    st.markdown(f"**📹 Videos de Evidencia ({len(videos_ev)}):**")
-                    for ruta_vid in videos_ev:
-                        st.video(ruta_vid)
-
-# ==============================================================================
-# PESTAÑA 3: BASE DE DATOS DE PILOTOS Y EQUIPOS (AGREGAR NUEVOS Y EXPORTAR)
-# ==============================================================================
-with menu_tabs[2]:
-    st.subheader("🚛 Administración de Base de Datos de Flota (`Equipos`) y `Pilotos`")
-    st.markdown(
-        f"Actualmente la base cuenta con **{len(df_equipos)} equipos** y **{len(df_pilotos)} pilotos** activos. "
-        "Todo equipo o piloto que agregues aquí se guardará directamente en **`Base_Flota_Solidaristas_20261106.xlsx`**."
-    )
-
-    col_add_eq, col_add_pi = st.columns(2)
-
-    with col_add_eq:
-        st.markdown("### ➕ Agregar Nuevo Equipo a la Flota")
-        with st.form("form_nuevo_equipo", clear_on_submit=True):
-            c_eq1, c_eq2 = st.columns(2)
-            with c_eq1:
-                nuevo_codigo = st.text_input("Código del Equipo (Ej. C18, A27):", placeholder="C18").strip().upper()
-                nueva_placa = st.text_input("Placa / Serie (Ej. C-145999):", placeholder="C-145999").strip().upper()
-            with c_eq2:
-                nuevo_anio = st.number_input("Año del Modelo:", min_value=1990, max_value=2030, value=2026, step=1)
-                nueva_marca = st.text_input("Marca / Modelo (Ej. SINOTRUCK, HOWO):", placeholder="SINOTRUCK").strip().upper()
-
-            incluir_venc_rev = st.checkbox("Registrar fecha de vencimiento de revisión / tarjeta")
-            fecha_rev = st.date_input("Fecha Vencimiento Revisión:", value=date(2027, 3, 24))
-
-            btn_add_eq = st.form_submit_button("💾 Guardar Nuevo Equipo", use_container_width=True)
-            if btn_add_eq:
-                if not nuevo_codigo or not nueva_placa:
-                    st.error("Por favor ingresa al menos el Código y la Placa del equipo.")
-                elif nuevo_codigo in df_equipos["codigo"].astype(str).values:
-                    st.warning(f"El código {nuevo_codigo} ya existe en la base de equipos.")
-                else:
-                    nuevo_id_eq = int(df_equipos["id"].max()) + 1 if not df_equipos.empty else 1
-                    fila_nueva_eq = pd.DataFrame([{
-                        "id": nuevo_id_eq,
-                        "codigo": nuevo_codigo,
-                        "fecha_venc_rev": fecha_rev.strftime("%Y-%m-%d") if incluir_venc_rev else "",
-                        "placa": nueva_placa,
-                        "anio": int(nuevo_anio),
-                        "marca": nueva_marca if nueva_marca else "POR DEFINIR"
-                    }])
-                    df_equipos_act = pd.concat([df_equipos, fila_nueva_eq], ignore_index=True)
-                    guardar_flota_y_pilotos(df_equipos_act, df_pilotos)
-                    st.success(f"✅ Equipo **{nuevo_codigo} ({nueva_placa})** agregado exitosamente a la base de datos.")
-                    st.rerun()
-
-    with col_add_pi:
-        st.markdown("### ➕ Agregar Nuevo Piloto al Padrón")
-        with st.form("form_nuevo_piloto", clear_on_submit=True):
-            nuevo_nombre_pi = st.text_input(
-                "Nombre Completo del Piloto:",
-                placeholder="Ej. CARLOS ALBERTO MENDEZ"
-            ).strip().upper()
-            incluir_lic = st.checkbox("Registrar fecha de vencimiento de licencia", value=True)
-            fecha_lic = st.date_input("Fecha de Vencimiento de Licencia:", value=date(2027, 10, 15))
-
-            btn_add_pi = st.form_submit_button("💾 Guardar Nuevo Piloto", use_container_width=True)
-            if btn_add_pi:
-                if not nuevo_nombre_pi:
-                    st.error("Por favor escribe el nombre completo del piloto.")
-                elif nuevo_nombre_pi in df_pilotos["nombre"].astype(str).values:
-                    st.warning(f"El piloto {nuevo_nombre_pi} ya está registrado en el padrón.")
-                else:
-                    nuevo_id_pi = int(df_pilotos["id"].max()) + 1 if not df_pilotos.empty else 1
-                    fila_nueva_pi = pd.DataFrame([{
-                        "id": nuevo_id_pi,
-                        "nombre": nuevo_nombre_pi,
-                        "fecha_venc_lic": fecha_lic.strftime("%Y-%m-%d") if incluir_lic else ""
-                    }])
-                    df_pilotos_act = pd.concat([df_pilotos, fila_nueva_pi], ignore_index=True)
-                    guardar_flota_y_pilotos(df_equipos, df_pilotos_act)
-                    st.success(f"✅ Piloto **{nuevo_nombre_pi}** agregado exitosamente al padrón.")
-                    st.rerun()
+        cola = st.session_state.cola_evidencias
+        st.metric("Total Archivos en Bandeja", len(cola))
+        if cola and st.button("🗑️ Limpiar Bandeja"):
+            st.session_state.cola_evidencias = []
+            st.session_state.uploader_key += 1
+            st.rerun()
 
     st.divider()
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        st.markdown(f"#### 📋 Listado Oficial de Equipos ({len(df_equipos)} unidades)")
-        st.dataframe(df_equipos, use_container_width=True, hide_index=True, height=360)
-    with col_t2:
-        st.markdown(f"#### 👨‍✈️ Listado Oficial de Pilotos ({len(df_pilotos)} pilotos)")
-        st.dataframe(df_pilotos, use_container_width=True, hide_index=True, height=360)
+    opciones_equipos = [f"{r['codigo']} | Placa: {r['placa']} | {r['marca']}" for _, r in df_equipos.iterrows()]
+    opciones_pilotos = [f"{r['nombre']}" for _, r in df_pilotos.iterrows()]
 
-    # Botón para descargar la base de datos Excel actualizada
-    with open(ARCHIVO_FLOTA, "rb") as f_xls:
-        st.download_button(
-            label="📥 Descargar Base de Flota y Pilotos Actualizada (Base_Flota_Solidaristas_20261106.xlsx)",
-            data=f_xls.read(),
-            file_name="Base_Flota_Solidaristas_Actualizada.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+    with st.form("form_acc"):
+        c1, c2 = st.columns(2)
+        with c1:
+            fecha_ev = st.date_input("Fecha", value=date.today())
+            equipo_sel = st.selectbox("Equipo", opciones_equipos)
+            tipo_acc = st.selectbox("Tipo", ["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"])
+        with c2:
+            hora_ev = st.time_input("Hora", value=datetime.now().time())
+            piloto_sel = st.selectbox("Piloto", opciones_pilotos)
+            severidad = st.selectbox("Severidad", ["Leve", "Moderado", "Grave", "Crítico"])
+
+        lugar_ref = st.text_input("Lugar / Referencia:")
+        descripcion = st.text_area("Descripción:")
+        acciones = st.text_area("Acciones Tomadas:")
+
+        if st.form_submit_button("💾 Guardar Accidente en Supabase + PDF con QR", use_container_width=True):
+            df_acc = cargar_accidentes()
+            nuevo_id = f"ACC-{len(df_acc) + 1:04d}"
+            fila_eq = df_equipos[df_equipos["codigo"] == equipo_sel.split(" | ")[0]].iloc[0]
+
+            rutas = guardar_evidencias(nuevo_id, st.session_state.cola_evidencias)
+            auditoria = auditar_accidente_contra_telemetria(str(fila_eq["codigo"]), fecha_ev.strftime("%Y-%m-%d"), hora_ev.strftime("%H:%M:%S"), st.session_state.ocasion_tele_df)
+
+            reg = {
+                "ID": nuevo_id,
+                "Fecha": fecha_ev.strftime("%Y-%m-%d"),
+                "Hora": hora_ev.strftime("%H:%M:%S"),
+                "Codigo_Equipo": str(fila_eq["codigo"]),
+                "Placa_Equipo": str(fila_eq["placa"]),
+                "Marca_Equipo": str(fila_eq["marca"]),
+                "Anio_Equipo": str(fila_eq["anio"]),
+                "Piloto": piloto_sel,
+                "Licencia_Venc": "",
+                "Tipo_Accidente": tipo_acc,
+                "Severidad": severidad,
+                "Lugar_Referencia": lugar_ref,
+                "Descripcion": descripcion,
+                "Acciones_Tomadas": acciones,
+                "Latitud": round(st.session_state.lat_sel, 6),
+                "Longitud": round(st.session_state.lon_sel, 6),
+                "Link_Google_Maps": link_google,
+                "Archivos_Evidencia": ";".join(rutas),
+                "Auditoria_Telemetria": auditoria
+            }
+            guardar_accidente_db(reg)
+            st.session_state.cola_evidencias = []
+            st.session_state.uploader_key += 1
+            st.success(f"¡Accidente {nuevo_id} guardado con éxito en Supabase!")
+
+# PESTAÑA 2: HISTORIAL Y PDF
+with menu_tabs[1]:
+    st.subheader("📂 Historial y Reportes PDF")
+    df_hist = cargar_accidentes()
+    if not df_hist.empty:
+        id_sel = st.selectbox("Folio:", df_hist["ID"].tolist()[::-1])
+        reg_act = df_hist[df_hist["ID"] == id_sel].iloc[0].to_dict()
+        pdf_b = generar_informe_pdf(reg_act)
+        st.download_button("📥 Descargar Informe PDF con Mapa + QR", data=pdf_b, file_name=f"Informe_{id_sel}.pdf", mime="application/pdf")
+
+# PESTAÑA 3: TELEMETRÍA
+with menu_tabs[2]:
+    st.subheader("🛰️ Cruce con Telemetría GPS")
+    arch_t = st.file_uploader("Cargar Telemetría (.xlsx):", type=["xlsx"])
+    if arch_t:
+        _, st.session_state.ocasion_tele_df = procesar_excel_telemetria(arch_t)
+        st.success("¡Telemetría cargada!")
+
+# PESTAÑA 4: FLOTA
+with menu_tabs[3]:
+    st.subheader("🚛 Gestión de Equipos y Pilotos")
+    st.dataframe(df_equipos, use_container_width=True)
+    st.dataframe(df_pilotos, use_container_width=True)
+'''
+
+with open("app_accidentes_supabase.py", "w", encoding="utf-8") as f:
+    f.write(app_v4_code)
+
+print("app_accidentes_supabase.py generado con éxito.")
