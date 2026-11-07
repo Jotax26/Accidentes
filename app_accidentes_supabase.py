@@ -1,5 +1,4 @@
-# Vamos a preparar el código completo y definitivo de la app integrando Supabase (tanto para base de datos PostgreSQL como para Storage de evidencias)
-app_v4_code = '''#!/usr/init/env python3
+#!/usr/init/env python3
 # -*- coding: utf-8 -*-
 """
 Plataforma Integral v4: Gestión de Accidentes, Flota, Evidencias Múltiples y Supabase Cloud
@@ -184,7 +183,7 @@ def convertir_a_hm(horas_dec):
 
 def normalizar_codigo_equipo(codigo_str):
     texto = str(codigo_str).upper().strip()
-    match_c = re.search(r"\\b([A-Z]+)-?(\\d+)\\b", texto)
+    match_c = re.search(r"\b([A-Z]+)-?(\d+)\b", texto)
     if match_c:
         return f"{match_c.group(1)}{match_c.group(2)}"
     return re.sub(r"[^A-Z0-9]", "", texto)
@@ -361,7 +360,7 @@ def buscar_direccion_nominatim(consulta):
 def extraer_coordenadas_de_texto_o_link(texto):
     if not texto:
         return None, None
-    patrones = [r"@(-?\\d+\\.\\d+),\\s*(-?\\d+\\.\\d+)", r"[?&]q=(-?\\d+\\.\\d+),\\s*(-?\\d+\\.\\d+)", r"(-?\\d+\\.\\d+)\\s*,\\s*(-?\\d+\\.\\d+)"]
+    patrones = [r"@(-?\d+\.\d+),\s*(-?\d+\.\d+)", r"[?&]q=(-?\d+\.\d+),\s*(-?\d+\.\d+)", r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)"]
     for pat in patrones:
         m = re.search(pat, str(texto))
         if m:
@@ -590,7 +589,7 @@ def procesar_excel_telemetria(filepath_or_buffer):
 
     def limpiar_equipo_tele(row):
         disp = str(row["Dispositivo"]).strip()
-        match_codigo = re.search(r"(C-\\d+)", disp)
+        match_codigo = re.search(r"(C-\d+)", disp)
         return match_codigo.group(1) if match_codigo else disp
 
     df["Equipo"] = df.apply(limpiar_equipo_tele, axis=1)
@@ -659,6 +658,33 @@ if "ocasion_tele_df" not in st.session_state:
             st.session_state.ocasion_tele_df = None
     else:
         st.session_state.ocasion_tele_df = None
+
+
+
+def exportar_backup_maestro_zip():
+    """Empaqueta en un único .ZIP toda la base de accidentes, el Excel de flota y todas las carpetas de evidencias."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(ARCHIVO_FLOTA):
+            zf.write(ARCHIVO_FLOTA, arcname=ARCHIVO_FLOTA)
+        if os.path.exists(ARCHIVO_ACCIDENTES):
+            zf.write(ARCHIVO_ACCIDENTES, arcname=ARCHIVO_ACCIDENTES)
+        if os.path.exists(ARCHIVO_TELEMETRIA_CACHE):
+            zf.write(ARCHIVO_TELEMETRIA_CACHE, arcname=ARCHIVO_TELEMETRIA_CACHE)
+        if os.path.exists(CARPETA_EVIDENCIAS):
+            for root, _, files in os.walk(CARPETA_EVIDENCIAS):
+                for file in files:
+                    ruta_completa = os.path.join(root, file)
+                    ruta_relativa = os.path.relpath(ruta_completa, ".")
+                    zf.write(ruta_completa, arcname=ruta_relativa)
+    buffer.seek(0)
+    return buffer
+
+def restaurar_backup_maestro_zip(uploaded_zip):
+    """Restaura la base de datos de accidentes, flota y todas las fotos/videos desde un archivo .ZIP."""
+    with zipfile.ZipFile(uploaded_zip, "r") as zf:
+        zf.extractall(".")
+    return True
 
 
 def agregar_archivos_a_cola(archivos_nuevos, categoria):
@@ -842,9 +868,3 @@ with menu_tabs[3]:
     st.subheader("🚛 Gestión de Equipos y Pilotos")
     st.dataframe(df_equipos, use_container_width=True)
     st.dataframe(df_pilotos, use_container_width=True)
-'''
-
-with open("app_accidentes_supabase.py", "w", encoding="utf-8") as f:
-    f.write(app_v4_code)
-
-print("app_accidentes_supabase.py generado con éxito.")
