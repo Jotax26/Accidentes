@@ -213,6 +213,7 @@ def inicializar_base_flota():
             df_pi.to_excel(writer, sheet_name="Pilotos", index=False)
 
 
+@st.cache_data(ttl=60)
 def cargar_flota_y_pilotos():
     inicializar_base_flota()
     if supabase_client:
@@ -251,6 +252,7 @@ def guardar_flota_y_pilotos(df_eq, df_pi):
         df_pi.to_excel(writer, sheet_name="Pilotos", index=False)
 
 
+@st.cache_data(ttl=10)
 def cargar_accidentes():
     columnas = [
         "ID", "Fecha", "Hora", "Codigo_Equipo", "Placa_Equipo", "Marca_Equipo", "Anio_Equipo",
