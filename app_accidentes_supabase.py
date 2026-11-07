@@ -43,6 +43,28 @@ st.set_page_config(
     layout="wide"
 )
 
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    .main { background-color: #f8fafc; }
+    div[data-testid="stMetric"] {
+        background-color: #ffffff; border: 1px solid #e2e8f0; padding: 14px 18px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    div[data-testid="stMetric"] label { color: #64748b !important; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; }
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] { color: #0f172a !important; font-weight: 700; font-size: 1.5rem; }
+    .stButton > button {
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); color: white; border: none; border-radius: 8px; font-weight: 600; padding: 0.5rem 1rem; box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.1); transition: all 0.2s ease-in-out;
+    }
+    .stButton > button:hover { background: linear-gradient(135deg, #0f172a 0%, #020617 100%); transform: translateY(-1px); }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; background-color: #f1f5f9; padding: 6px; border-radius: 12px; }
+    .stTabs [data-baseweb="tab"] { border-radius: 8px; color: #475569; font-weight: 600; padding: 8px 16px; }
+    .stTabs [aria-selected="true"] { background-color: #ffffff !important; color: #1e293b !important; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+</style>
+""", unsafe_allow_html=True)
+
+
 ARCHIVO_FLOTA = "Base_Flota_Solidaristas_20261106.xlsx"
 ARCHIVO_ACCIDENTES = "registro_accidentes_solidaristas.csv"
 ARCHIVO_TELEMETRIA_CACHE = "telemetria_actual_cache.xlsx"
@@ -660,7 +682,6 @@ if "ocasion_tele_df" not in st.session_state:
             st.session_state.ocasion_tele_df = None
     else:
         st.session_state.ocasion_tele_df = None
-
 
 
 def exportar_backup_maestro_zip():
