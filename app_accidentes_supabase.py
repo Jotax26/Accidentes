@@ -155,7 +155,6 @@ CARPETA_EVIDENCIAS = "evidencias_accidentes"
 
 os.makedirs(CARPETA_EVIDENCIAS, exist_ok=True)
 
-# Semilla inicial con los 61 equipos y 37 pilotos del Excel oficial
 EQUIPOS_INICIALES = [
     {"id": 1, "codigo": "A01", "fecha_venc_rev": "", "placa": "C-125657", "anio": 2013, "marca": "INTERNATIONAL"},
     {"id": 2, "codigo": "A02", "fecha_venc_rev": "", "placa": "C-125502", "anio": 2013, "marca": "INTERNATIONAL"},
@@ -667,7 +666,7 @@ def procesar_excel_telemetria(filepath_or_buffer):
 
     def limpiar_equipo_tele(row):
         disp = str(row["Dispositivo"]).strip()
-        match_codigo = re.search(r"(C-\\d+)", disp)
+        match_codigo = re.search(r"(C-\d+)", disp)
         return match_codigo.group(1) if match_codigo else disp
 
     df["Equipo"] = df.apply(limpiar_equipo_tele, axis=1)
@@ -690,4 +689,239 @@ def procesar_excel_telemetria(filepath_or_buffer):
     ocasion_df["tiempo_bruto_h"] = (ocasion_df["ultima_salida"] - ocasion_df["primera_llegada"]).dt.total_seconds() / 3600.0
     ocasion_df["Turno"] = np.where(ocasion_df["primera_llegada"].dt.hour < 12, "Carga AM", "Carga PM")
     ocasion_df["Tiempo_Neto_HM"] = ocasion_df["tiempo_neto_h"].apply(convertir_a_hm)
-    ocasion_df["Hora_Inicio"] = ocasion_df["primera_llegada"].dt.strftime("%H
+    ocasion_df["Hora_Inicio"] = ocasion_df["primera_llegada"].dt.strftime("%H:%M:%S")
+    ocasion_df["Hora_Fin"] = ocasion_df["ultima_salida"].dt.strftime("%H:%M:%S")
+    return df, ocasion_df
+
+def auditar_accidente_contra_telemetria(codigo_eq, fecha_str, hora_str, ocasion_df):
+    if ocasion_df is None or ocasion_df.empty:
+        return "Sin archivo de telemetría cargado para cruce."
+    cod_norm = normalizar_codigo_equipo(codigo_eq)
+    sub = ocasion_df[ocasion_df["Codigo_Norm"] == cod_norm].copy()
+    if sub.empty:
+        return f"La unidad {codigo_eq} no registra entradas en telemetría."
+    try:
+        dt_acc = pd.to_datetime(f"{fecha_str} {hora_str}")
+    except Exception:
+        return "Fecha/hora no válida."
+
+    en_planta = sub[(sub["primera_llegada"] <= dt_acc) & (dt_acc <= sub["ultima_salida"])]
+    if not en_planta.empty:
+        r = en_planta.iloc[0]
+        return f"EN PLANTA: Ocurrió mientras la unidad estaba en PLANTA EL RONCO ({r['Turno']}, entrada {r['Hora_Inicio']} - salida {r['Hora_Fin']}, estancia {r['Tiempo_Neto_HM']})."
+    return f"EN RUTA EXTERNA: La unidad operaba fuera de planta al momento del suceso."
+
+if "lat_sel" not in st.session_state:
+    st.session_state.lat_sel = 14.286111
+if "lon_sel" not in st.session_state:
+    st.session_state.lon_sel = -89.458611
+if "cola_evidencias" not in st.session_state:
+    st.session_state.cola_evidencias = []
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+if "resultados_busqueda_mapa" not in st.session_state:
+    st.session_state.resultados_busqueda_mapa = []
+
+if "ocasion_tele_df" not in st.session_state:
+    if os.path.exists(ARCHIVO_TELEMETRIA_CACHE):
+        try:
+            _, st.session_state.ocasion_tele_df = procesar_excel_telemetria(ARCHIVO_TELEMETRIA_CACHE)
+        except Exception:
+            st.session_state.ocasion_tele_df = None
+    else:
+        st.session_state.ocasion_tele_df = None
+
+def exportar_backup_maestro_zip():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(ARCHIVO_FLOTA):
+            zf.write(ARCHIVO_FLOTA, arcname=ARCHIVO_FLOTA)
+        if os.path.exists(ARCHIVO_ACCIDENTES):
+            zf.write(ARCHIVO_ACCIDENTES, arcname=ARCHIVO_ACCIDENTES)
+        if os.path.exists(ARCHIVO_TELEMETRIA_CACHE):
+            zf.write(ARCHIVO_TELEMETRIA_CACHE, arcname=ARCHIVO_TELEMETRIA_CACHE)
+        if os.path.exists(CARPETA_EVIDENCIAS):
+            for root, _, files in os.walk(CARPETA_EVIDENCIAS):
+                for file in files:
+                    zf.write(os.path.join(root, file), arcname=os.path.relpath(os.path.join(root, file), "."))
+    buffer.seek(0)
+    return buffer
+
+def restaurar_backup_maestro_zip(uploaded_zip):
+    with zipfile.ZipFile(uploaded_zip, "r") as zf:
+        zf.extractall(".")
+    return True
+
+def agregar_archivos_a_cola(archivos_nuevos, categoria):
+    agregados = 0
+    nombres_existentes = {(item["nombre"], item["tamano"]) for item in st.session_state.cola_evidencias}
+    for arch in archivos_nuevos:
+        contenido = arch.getvalue()
+        clave = (arch.name, len(contenido))
+        if clave not in nombres_existentes:
+            st.session_state.cola_evidencias.append({"nombre": arch.name, "categoria": categoria, "tamano": len(contenido), "bytes": contenido})
+            nombres_existentes.add(clave)
+            agregados += 1
+    return agregados
+
+df_equipos, df_pilotos = cargar_flota_y_pilotos()
+
+with st.sidebar:
+    st.header("☁️ Supabase Cloud & Respaldo")
+    estado_nube = "Supabase Cloud Conectado 🟢" if supabase_client else "Almacenamiento Local + ZIP 🟡"
+    st.success(f"**Estado:** {estado_nube}")
+    zip_maestro = exportar_backup_maestro_zip()
+    st.download_button(
+        label="💾 Descargar Respaldo Maestro (.ZIP)",
+        data=zip_maestro,
+        file_name=f"Backup_Solidaristas_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
+    with st.expander("📤 Restaurar Respaldo (.ZIP)"):
+        zip_subido = st.file_uploader("Sube tu archivo ZIP:", type=["zip"])
+        if zip_subido and st.button("🔄 Restaurar Ahora"):
+            restaurar_backup_maestro_zip(zip_subido)
+            st.success("¡Restaurado con éxito!")
+            st.rerun()
+
+st.title("🚨 Panel de Control de Accidentes y Flota - Solidaristas")
+menu_tabs = st.tabs([
+    "📝 1. Registrar Accidente",
+    "📂 2. Historial y Reportes PDF",
+    "🛰️ 3. Cruce con Telemetría GPS",
+    "🚛 4. Base de Datos: Flota y Pilotos"
+])
+
+with menu_tabs[0]:
+    col_mapa, col_evidencias = st.columns([1.2, 1.2])
+    with col_mapa:
+        st.subheader("🗺️ 1. Ubicación en Google Maps, Buscador y GPS")
+        consulta_mapa = st.text_input("🔍 Buscar lugar, carretera o coordenadas:", placeholder="Ej. Metapán, Santa Ana o 14.2861, -89.4586")
+        if st.button("🔎 Buscar en Mapa", use_container_width=True):
+            lat_p, lon_p = extraer_coordenadas_de_texto_o_link(consulta_mapa)
+            if lat_p is not None:
+                st.session_state.lat_sel, st.session_state.lon_sel = lat_p, lon_p
+                st.rerun()
+            else:
+                st.session_state.resultados_busqueda_mapa = buscar_direccion_nominatim(consulta_mapa)
+
+        if st.session_state.resultados_busqueda_mapa:
+            opciones_lugares = [f"{r['nombre'][:80]} ({r['lat']:.5f}, {r['lon']:.5f})" for r in st.session_state.resultados_busqueda_mapa]
+            lug_sel = st.selectbox("Resultados:", opciones_lugares)
+            if st.button("✅ Centrar Mapa"):
+                idx = opciones_lugares.index(lug_sel)
+                st.session_state.lat_sel = st.session_state.resultados_busqueda_mapa[idx]["lat"]
+                st.session_state.lon_sel = st.session_state.resultados_busqueda_mapa[idx]["lon"]
+                st.session_state.resultados_busqueda_mapa = []
+                st.rerun()
+
+        tipo_mapa = st.radio("Vista:", ["Google Maps (Calles)", "Google Satélite (Híbrido)", "Google Satélite Puro"], horizontal=True)
+        tiles_url = "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}" if "Calles" in tipo_mapa else ("https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}" if "Híbrido" in tipo_mapa else "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}")
+
+        m = folium.Map(location=[st.session_state.lat_sel, st.session_state.lon_sel], zoom_start=15, tiles=tiles_url, attr="Google Maps")
+        m.add_child(folium.LatLngPopup())
+        link_actual = f"https://www.google.com/maps?q={st.session_state.lat_sel:.6f},{st.session_state.lon_sel:.6f}"
+        folium.Marker([st.session_state.lat_sel, st.session_state.lon_sel], icon=folium.Icon(color="red")).add_to(m)
+
+        mapa_output = st_folium(m, width="100%", height=410, key="mapa_reg")
+        if mapa_output and mapa_output.get("last_clicked"):
+            st.session_state.lat_sel = mapa_output["last_clicked"]["lat"]
+            st.session_state.lon_sel = mapa_output["last_clicked"]["lng"]
+            st.rerun()
+
+        link_google = f"https://www.google.com/maps?q={st.session_state.lat_sel:.6f},{st.session_state.lon_sel:.6f}"
+        st.info(f"📍 **Coordenadas:** `{st.session_state.lat_sel:.6f}, {st.session_state.lon_sel:.6f}`")
+
+    with col_evidencias:
+        st.subheader("📷📹 2. Carga Masiva de Evidencias Digitales")
+        sub1, sub2 = st.tabs(["🖼️ Imágenes (5, 10+)", "🎬 Videos (5+)"])
+        with sub1:
+            fotos_up = st.file_uploader("Fotos:", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key=f"f_{st.session_state.uploader_key}")
+            if fotos_up:
+                agregar_archivos_a_cola(fotos_up, "IMAGEN")
+        with sub2:
+            videos_up = st.file_uploader("Videos:", type=["mp4", "mov", "avi"], accept_multiple_files=True, key=f"v_{st.session_state.uploader_key}")
+            if videos_up:
+                agregar_archivos_a_cola(videos_up, "VIDEO")
+
+        cola = st.session_state.cola_evidencias
+        st.metric("Total Archivos en Bandeja", len(cola))
+        if cola and st.button("🗑️ Limpiar Bandeja"):
+            st.session_state.cola_evidencias = []
+            st.session_state.uploader_key += 1
+            st.rerun()
+
+    st.divider()
+    opciones_equipos = [f"{r['codigo']} | Placa: {r['placa']} | {r['marca']}" for _, r in df_equipos.iterrows()]
+    opciones_pilotos = [f"{r['nombre']}" for _, r in df_pilotos.iterrows()]
+
+    with st.form("form_acc"):
+        c1, c2 = st.columns(2)
+        with c1:
+            fecha_ev = st.date_input("Fecha", value=date.today())
+            equipo_sel = st.selectbox("Equipo", opciones_equipos)
+            tipo_acc = st.selectbox("Tipo", ["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"])
+        with c2:
+            hora_ev = st.time_input("Hora", value=datetime.now().time())
+            piloto_sel = st.selectbox("Piloto", opciones_pilotos)
+            severidad = st.selectbox("Severidad", ["Leve", "Moderado", "Grave", "Crítico"])
+
+        lugar_ref = st.text_input("Lugar / Referencia:")
+        descripcion = st.text_area("Descripción:")
+        acciones = st.text_area("Acciones Tomadas:")
+
+        if st.form_submit_button("💾 Guardar Accidente en Supabase + PDF con QR", kind="primary", use_container_width=True):
+            df_acc = cargar_accidentes()
+            nuevo_id = f"ACC-{len(df_acc) + 1:04d}"
+            fila_eq = df_equipos[df_equipos["codigo"] == equipo_sel.split(" | ")[0]].iloc[0]
+
+            rutas = guardar_evidencias(nuevo_id, st.session_state.cola_evidencias)
+            auditoria = auditar_accidente_contra_telemetria(str(fila_eq["codigo"]), fecha_ev.strftime("%Y-%m-%d"), hora_ev.strftime("%H:%M:%S"), st.session_state.ocasion_tele_df)
+
+            reg = {
+                "ID": nuevo_id,
+                "Fecha": fecha_ev.strftime("%Y-%m-%d"),
+                "Hora": hora_ev.strftime("%H:%M:%S"),
+                "Codigo_Equipo": str(fila_eq["codigo"]),
+                "Placa_Equipo": str(fila_eq["placa"]),
+                "Marca_Equipo": str(fila_eq["marca"]),
+                "Anio_Equipo": str(fila_eq["anio"]),
+                "Piloto": piloto_sel,
+                "Licencia_Venc": "",
+                "Tipo_Accidente": tipo_acc,
+                "Severidad": severidad,
+                "Lugar_Referencia": lugar_ref,
+                "Descripcion": descripcion,
+                "Acciones_Tomadas": acciones,
+                "Latitud": round(st.session_state.lat_sel, 6),
+                "Longitud": round(st.session_state.lon_sel, 6),
+                "Link_Google_Maps": link_google,
+                "Archivos_Evidencia": ";".join(rutas),
+                "Auditoria_Telemetria": auditoria
+            }
+            guardar_accidente_db(reg)
+            st.session_state.cola_evidencias = []
+            st.session_state.uploader_key += 1
+            st.success(f"¡Accidente {nuevo_id} guardado con éxito en Supabase!")
+
+with menu_tabs[1]:
+    st.subheader("📂 Historial y Reportes PDF")
+    df_hist = cargar_accidentes()
+    if not df_hist.empty:
+        id_sel = st.selectbox("Folio:", df_hist["ID"].tolist()[::-1])
+        reg_act = df_hist[df_hist["ID"] == id_sel].iloc[0].to_dict()
+        pdf_b = generar_informe_pdf(reg_act)
+        st.download_button("📥 Descargar Informe PDF con Mapa + QR", data=pdf_b, file_name=f"Informe_{id_sel}.pdf", mime="application/pdf")
+
+with menu_tabs[2]:
+    st.subheader("🛰️ Cruce con Telemetría GPS")
+    arch_t = st.file_uploader("Cargar Telemetría (.xlsx):", type=["xlsx"])
+    if arch_t:
+        _, st.session_state.ocasion_tele_df = procesar_excel_telemetria(arch_t)
+        st.success("¡Telemetría cargada!")
+
+with menu_tabs[3]:
+    st.subheader("🚛 Gestión de Equipos y Pilotos")
+    st.dataframe(df_equipos, use_container_width=True)
+    st.dataframe(df_pilotos, use_container_width=True)
