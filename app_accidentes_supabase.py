@@ -8,7 +8,7 @@ Plataforma Integral Definitiva: Gestión de Accidentes, Flota, Evidencias Múlti
 - Buscador geográfico y geolocalización GPS en tiempo real.
 - Informe Ejecutivo en PDF con Mapa Satelital Estático y Código QR escaneable hacia Google Maps.
 - Motor de Auditoría de Telemetría GPS con regla de brecha >= 4 horas en Formato Horas y Minutos 'Xh Ym'.
-- Respaldo Maestro Portátil en archivo .ZIP y edición interactiva de Flota/Pilotos en Pestaña 4.
+- Respaldo Maestro Portátil en archivo .ZIP y Edición de Expedientes en Historial.
 """
 
 import os
@@ -155,7 +155,6 @@ CARPETA_EVIDENCIAS = "evidencias_accidentes"
 
 os.makedirs(CARPETA_EVIDENCIAS, exist_ok=True)
 
-# Semilla inicial con los 61 equipos y 37 pilotos del Excel oficial
 EQUIPOS_INICIALES = [
     {"id": 1, "codigo": "A01", "fecha_venc_rev": "", "placa": "C-125657", "anio": 2013, "marca": "INTERNATIONAL"},
     {"id": 2, "codigo": "A02", "fecha_venc_rev": "", "placa": "C-125502", "anio": 2013, "marca": "INTERNATIONAL"},
@@ -383,8 +382,13 @@ def guardar_accidente_db(nuevo_reg):
             pass
 
     df = cargar_accidentes()
-    df_nuevo = pd.DataFrame([nuevo_reg])
-    df_final = pd.concat([df, df_nuevo], ignore_index=True)
+    # Si ya existe el ID, lo actualizamos; si no, lo agregamos
+    if not df.empty and nuevo_reg["ID"] in df["ID"].values:
+        df.loc[df["ID"] == nuevo_reg["ID"]] = pd.DataFrame([nuevo_reg])
+        df_final = df
+    else:
+        df_nuevo = pd.DataFrame([nuevo_reg])
+        df_final = pd.concat([df, df_nuevo], ignore_index=True)
     df_final.to_csv(ARCHIVO_ACCIDENTES, index=False, encoding="utf-8-sig")
     return df_final
 
@@ -907,13 +911,39 @@ with menu_tabs[0]:
             st.success(f"¡Accidente {nuevo_id} guardado con éxito en Supabase!")
 
 with menu_tabs[1]:
-    st.subheader("📂 Historial y Reportes PDF")
+    st.subheader("📂 Historial, Edición de Expedientes y Reportes PDF")
     df_hist = cargar_accidentes()
-    if not df_hist.empty:
-        id_sel = st.selectbox("Folio:", df_hist["ID"].tolist()[::-1])
+    if df_hist.empty:
+        st.info("No hay accidentes registrados todavía.")
+    else:
+        id_sel = st.selectbox("Selecciona el Folio del Expediente para ver o editar:", df_hist["ID"].tolist()[::-1])
         reg_act = df_hist[df_hist["ID"] == id_sel].iloc[0].to_dict()
-        pdf_b = generar_informe_pdf(reg_act)
-        st.download_button("📥 Descargar Informe PDF con Mapa + QR", data=pdf_b, file_name=f"Informe_{id_sel}.pdf", mime="application/pdf")
+
+        col_rep1, col_rep2 = st.columns([1, 1])
+        with col_rep1:
+            pdf_b = generar_informe_pdf(reg_act)
+            st.download_button("📥 Descargar Informe PDF con Mapa + QR", data=pdf_b, file_name=f"Informe_{id_sel}.pdf", mime="application/pdf", use_container_width=True)
+        with col_rep2:
+            zip_b = generar_zip_expediente(reg_act)
+            st.download_button("📦 Descargar Expediente .ZIP", data=zip_b, file_name=f"Expediente_{id_sel}.zip", mime="application/zip", use_container_width=True)
+
+        with st.expander(f"✏️ Modificar o Actualizar Registro del Folio {id_sel}", expanded=False):
+            with st.form(f"form_editar_{id_sel}"):
+                nuevo_tipo = st.selectbox("Tipo de Incidente", ["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"], index=["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"].index(reg_act.get("Tipo_Accidente", "Otro")) if reg_act.get("Tipo_Accidente") in ["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"] else 0)
+                nueva_sev = st.selectbox("Severidad", ["Leve", "Moderado", "Grave", "Crítico"], index=["Leve", "Moderado", "Grave", "Crítico"].index(reg_act.get("Severidad", "Moderado")) if reg_act.get("Severidad") in ["Leve", "Moderado", "Grave", "Crítico"] else 1)
+                nueva_ref = st.text_input("Lugar / Referencia", value=str(reg_act.get("Lugar_Referencia", "")))
+                nueva_desc = st.text_area("Descripción detallada", value=str(reg_act.get("Descripcion", "")))
+                nuevas_acc = st.text_area("Acciones Tomadas", value=str(reg_act.get("Acciones_Tomadas", "")))
+
+                if st.form_submit_button("💾 Guardar Cambios del Expediente", type="primary", use_container_width=True):
+                    reg_act["Tipo_Accidente"] = nuevo_tipo
+                    reg_act["Severidad"] = nueva_sev
+                    reg_act["Lugar_Referencia"] = nueva_ref
+                    reg_act["Descripcion"] = nueva_desc
+                    reg_act["Acciones_Tomadas"] = nuevas_acc
+                    guardar_accidente_db(reg_act)
+                    st.success(f"✅ ¡Expediente {id_sel} actualizado correctamente en la base de datos y Supabase!")
+                    st.rerun()
 
 with menu_tabs[2]:
     st.subheader("🛰️ Cruce con Telemetría GPS")
