@@ -8,7 +8,7 @@ Plataforma Integral Definitiva: Gestión de Accidentes, Flota, Evidencias Múlti
 - Buscador geográfico y geolocalización GPS en tiempo real.
 - Informe Ejecutivo en PDF con Mapa Satelital Estático y Código QR escaneable hacia Google Maps.
 - Motor de Auditoría de Telemetría GPS con regla de brecha >= 4 horas en Formato Horas y Minutos 'Xh Ym'.
-- Respaldo Maestro Portátil en archivo .ZIP.
+- Respaldo Maestro Portátil en archivo .ZIP y edición interactiva de Flota/Pilotos en Pestaña 4.
 """
 
 import os
@@ -923,6 +923,47 @@ with menu_tabs[2]:
         st.success("¡Telemetría cargada!")
 
 with menu_tabs[3]:
-    st.subheader("🚛 Gestión de Equipos y Pilotos")
-    st.dataframe(df_equipos, use_container_width=True)
-    st.dataframe(df_pilotos, use_container_width=True)
+    st.subheader("🚛 Gestión, Edición y Adición de Flota y Pilotos")
+    st.markdown(
+        "Modifica directamente los datos de los equipos o pilotos en las tablas inferiores, "
+        "o utiliza los formularios para dar de alta nuevas unidades y operadores en Supabase y en el archivo Excel."
+    )
+
+    tab_eq_edit, tab_pi_edit = st.tabs(["📋 Editar y Agregar Equipos", "👨‍✈️ Editar y Agregar Pilotos"])
+
+    with tab_eq_edit:
+        st.markdown("##### 📋 Listado Interactivo de Equipos (Doble clic en cualquier celda para editar)")
+        df_equipos_editado = st.data_editor(
+            df_equipos,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_equipos_flota"
+        )
+        if st.button("💾 Guardar Cambios en Equipos", key="btn_save_eq_db", use_container_width=True):
+            guardar_flota_y_pilotos(df_equipos_editado, df_pilotos)
+            st.success("✅ ¡Base de datos de equipos actualizada y sincronizada con Supabase exitosamente!")
+            st.rerun()
+
+    with tab_pi_edit:
+        st.markdown("##### 👨‍✈️ Padrón Interactivo de Pilotos (Doble clic en cualquier celda para editar)")
+        df_pilotos_editado = st.data_editor(
+            df_pilotos,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_pilotos_padron"
+        )
+        if st.button("💾 Guardar Cambios en Pilotos", key="btn_save_pi_db", use_container_width=True):
+            guardar_flota_y_pilotos(df_equipos, df_pilotos_editado)
+            st.success("✅ ¡Padrón de pilotos actualizado y sincronizado con Supabase exitosamente!")
+            st.rerun()
+
+    st.divider()
+    st.markdown("##### 📥 Exportar Base de Datos Completa")
+    with open(ARCHIVO_FLOTA, "rb") as f_xls:
+        st.download_button(
+            label="📥 Descargar Archivo Excel Actualizado (Base_Flota_Solidaristas_Actualizada.xlsx)",
+            data=f_xls.read(),
+            file_name="Base_Flota_Solidaristas_Actualizada.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
