@@ -382,12 +382,10 @@ def guardar_accidente_db(nuevo_reg):
             pass
 
     df = cargar_accidentes()
-    if not df.empty and nuevo_reg["ID"] in df["ID"].values:
-        df.loc[df["ID"] == nuevo_reg["ID"]] = pd.DataFrame([nuevo_reg])
-        df_final = df
-    else:
-        df_nuevo = pd.DataFrame([nuevo_reg])
-        df_final = pd.concat([df, df_nuevo], ignore_index=True)
+    df_nuevo = pd.DataFrame([nuevo_reg])
+    if not df.empty and "ID" in df.columns and nuevo_reg["ID"] in df["ID"].values:
+        df = df[df["ID"] != nuevo_reg["ID"]].copy()
+    df_final = pd.concat([df, df_nuevo], ignore_index=True)
     df_final.to_csv(ARCHIVO_ACCIDENTES, index=False, encoding="utf-8-sig")
     return df_final
 
