@@ -8,7 +8,7 @@ Plataforma Integral Definitiva: Gestión de Accidentes, Flota, Evidencias Múlti
 - Buscador geográfico y geolocalización GPS en tiempo real.
 - Informe Ejecutivo en PDF con Mapa Satelital Estático y Código QR escaneable hacia Google Maps.
 - Motor de Auditoría de Telemetría GPS con regla de brecha >= 4 horas en Formato Horas y Minutos 'Xh Ym'.
-- Respaldo Maestro Portátil en archivo .ZIP y Edición de Expedientes en Historial.
+- Respaldo Maestro Portátil en archivo .ZIP y Edición Total de Expedientes en Historial.
 """
 
 import os
@@ -382,7 +382,6 @@ def guardar_accidente_db(nuevo_reg):
             pass
 
     df = cargar_accidentes()
-    # Si ya existe el ID, lo actualizamos; si no, lo agregamos
     if not df.empty and nuevo_reg["ID"] in df["ID"].values:
         df.loc[df["ID"] == nuevo_reg["ID"]] = pd.DataFrame([nuevo_reg])
         df_final = df
@@ -911,15 +910,15 @@ with menu_tabs[0]:
             st.success(f"¡Accidente {nuevo_id} guardado con éxito en Supabase!")
 
 with menu_tabs[1]:
-    st.subheader("📂 Historial, Edición de Expedientes y Reportes PDF")
+    st.subheader("📂 Historial, Edición Completa y Reportes PDF")
     df_hist = cargar_accidentes()
     if df_hist.empty:
-        st.info("No hay accidentes registrados todavía.")
+        st.info("Aún no hay accidentes registrados.")
     else:
-        id_sel = st.selectbox("Selecciona el Folio del Expediente para ver o editar:", df_hist["ID"].tolist()[::-1])
+        id_sel = st.selectbox("Selecciona el Folio del Expediente:", df_hist["ID"].tolist()[::-1])
         reg_act = df_hist[df_hist["ID"] == id_sel].iloc[0].to_dict()
 
-        col_rep1, col_rep2 = st.columns([1, 1])
+        col_rep1, col_rep2 = st.columns(2)
         with col_rep1:
             pdf_b = generar_informe_pdf(reg_act)
             st.download_button("📥 Descargar Informe PDF con Mapa + QR", data=pdf_b, file_name=f"Informe_{id_sel}.pdf", mime="application/pdf", use_container_width=True)
@@ -927,23 +926,117 @@ with menu_tabs[1]:
             zip_b = generar_zip_expediente(reg_act)
             st.download_button("📦 Descargar Expediente .ZIP", data=zip_b, file_name=f"Expediente_{id_sel}.zip", mime="application/zip", use_container_width=True)
 
-        with st.expander(f"✏️ Modificar o Actualizar Registro del Folio {id_sel}", expanded=False):
-            with st.form(f"form_editar_{id_sel}"):
-                nuevo_tipo = st.selectbox("Tipo de Incidente", ["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"], index=["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"].index(reg_act.get("Tipo_Accidente", "Otro")) if reg_act.get("Tipo_Accidente") in ["Colisión vehicular", "Daño mecánico", "Salida de vía", "Incidente en planta", "Otro"] else 0)
-                nueva_sev = st.selectbox("Severidad", ["Leve", "Moderado", "Grave", "Crítico"], index=["Leve", "Moderado", "Grave", "Crítico"].index(reg_act.get("Severidad", "Moderado")) if reg_act.get("Severidad") in ["Leve", "Moderado", "Grave", "Crítico"] else 1)
-                nueva_ref = st.text_input("Lugar / Referencia", value=str(reg_act.get("Lugar_Referencia", "")))
-                nueva_desc = st.text_area("Descripción detallada", value=str(reg_act.get("Descripcion", "")))
-                nuevas_acc = st.text_area("Acciones Tomadas", value=str(reg_act.get("Acciones_Tomadas", "")))
+        st.divider()
+        st.markdown(f"#### ✏️ Modificación Completa de Registros - Folio `{id_sel}`")
+        st.caption("Puedes cambiar cualquier parámetro ingresado originalmente (fecha, hora, equipo, piloto, lugar, coordenadas, descripción, etc.).")
 
-                if st.form_submit_button("💾 Guardar Cambios del Expediente", type="primary", use_container_width=True):
-                    reg_act["Tipo_Accidente"] = nuevo_tipo
-                    reg_act["Severidad"] = nueva_sev
-                    reg_act["Lugar_Referencia"] = nueva_ref
-                    reg_act["Descripcion"] = nueva_desc
-                    reg_act["Acciones_Tomadas"] = nuevas_acc
-                    guardar_accidente_db(reg_act)
-                    st.success(f"✅ ¡Expediente {id_sel} actualizado correctamente en la base de datos y Supabase!")
-                    st.rerun()
+        with st.form(f"form_edicion_total_{id_sel}"):
+            f_col1, f_col2, f_col3 = st.columns(3)
+            with f_col1:
+                try:
+                    dt_val = datetime.strptime(str(reg_act.get("Fecha", date.today())), "%Y-%m-%d").date()
+                except Exception:
+                    dt_val = date.today()
+                nueva_fecha = st.date_input("Fecha del Suceso", value=dt_val)
+
+                eq_list = [f"{r['codigo']} | Placa: {r['placa']} | {r['marca']}" for _, r in df_equipos.iterrows()]
+                eq_actual_str = str(reg_act.get("Codigo_Equipo", ""))
+                idx_eq = 0
+                for i, eq_opt in enumerate(eq_list):
+                    if eq_actual_str in eq_opt:
+                        idx_eq = i
+                        break
+                nuevo_equipo_sel = st.selectbox("Unidad / Equipo", eq_list, index=idx_eq)
+
+            with f_col2:
+                try:
+                    t_val = datetime.strptime(str(reg_act.get("Hora", "00:00:00")), "%H:%M:%S").time()
+                except Exception:
+                    t_val = datetime.now().time()
+                nueva_hora = st.time_input("Hora del Suceso", value=t_val)
+
+                pi_list = [r['nombre'] for _, r in df_pilotos.iterrows()]
+                pi_actual_str = str(reg_act.get("Piloto", ""))
+                idx_pi = 0
+                for i, pi_opt in enumerate(pi_list):
+                    if pi_actual_str.upper() in pi_opt.upper():
+                        idx_pi = i
+                        break
+                nuevo_piloto_sel = st.selectbox("Piloto Asignado", pi_list, index=idx_pi)
+
+            with f_col3:
+                tipos_acc_opts = [
+                    "Colisión vehicular en ruta", "Incidente en maniobra dentro de planta",
+                    "Daño mecánico / Falla de equipo", "Salida de vía / Cuneta",
+                    "Daño a terceros / Propiedad", "Derrame o pérdida de carga", "Otro incidente operativo"
+                ]
+                t_acc_act = str(reg_act.get("Tipo_Accidente", ""))
+                idx_t_acc = 0
+                for i, t_opt in enumerate(tipos_acc_opts):
+                    if t_acc_act.lower() in t_opt.lower():
+                        idx_t_acc = i
+                        break
+                nuevo_tipo_acc = st.selectbox("Tipo de Situación", tipos_acc_opts, index=idx_t_acc)
+
+                sev_opts = ["Leve", "Moderado", "Grave", "Crítico"]
+                sev_act = str(reg_act.get("Severidad", "Moderado"))
+                idx_sev = sev_opts.index(sev_act) if sev_act in sev_opts else 1
+                nueva_severidad = st.selectbox("Nivel de Severidad", sev_opts, index=idx_sev)
+
+            nueva_lugar = st.text_input("Lugar o Punto de Referencia:", value=str(reg_act.get("Lugar_Referencia", "")))
+
+            c_coord1, c_coord2 = st.columns(2)
+            with c_coord1:
+                try:
+                    lat_val = float(reg_act.get("Latitud", 14.286111))
+                except Exception:
+                    lat_val = 14.286111
+                nueva_lat = st.number_input("Latitud GPS", value=lat_val, format="%.6f", step=0.000001)
+            with c_coord2:
+                try:
+                    lon_val = float(reg_act.get("Longitud", -89.458611))
+                except Exception:
+                    lon_val = -89.458611
+                nueva_lon = st.number_input("Longitud GPS", value=lon_val, format="%.6f", step=0.000001)
+
+            c_txt1, c_txt2 = st.columns(2)
+            with c_txt1:
+                nueva_desc = st.text_area("Descripción detallada de la situación:", value=str(reg_act.get("Descripcion", "")), height=110)
+            with c_txt2:
+                nuevas_acciones = st.text_area("Acciones inmediatas tomadas:", value=str(reg_act.get("Acciones_Tomadas", "")), height=110)
+
+            if st.form_submit_button(f"💾 Actualizar Todos los Datos del Folio {id_sel}", type="primary", use_container_width=True):
+                cod_eq = nuevo_equipo_sel.split(" | ")[0].strip()
+                fila_eq = df_equipos[df_equipos["codigo"].astype(str) == cod_eq].iloc[0]
+
+                nuevo_link_maps = f"https://www.google.com/maps?q={nueva_lat:.6f},{nueva_lon:.6f}"
+                nueva_auditoria = auditar_accidente_contra_telemetria(str(fila_eq["codigo"]), nueva_fecha.strftime("%Y-%m-%d"), nueva_hora.strftime("%H:%M:%S"), st.session_state.ocasion_tele_df)
+
+                reg_actualizado = {
+                    "ID": id_sel,
+                    "Fecha": nueva_fecha.strftime("%Y-%m-%d"),
+                    "Hora": nueva_hora.strftime("%H:%M:%S"),
+                    "Codigo_Equipo": str(fila_eq["codigo"]),
+                    "Placa_Equipo": str(fila_eq["placa"]),
+                    "Marca_Equipo": str(fila_eq["marca"]),
+                    "Anio_Equipo": str(fila_eq["anio"]),
+                    "Piloto": nuevo_piloto_sel,
+                    "Licencia_Venc": str(reg_act.get("Licencia_Venc", "")),
+                    "Tipo_Accidente": nuevo_tipo_acc,
+                    "Severidad": nueva_severidad,
+                    "Lugar_Referencia": nueva_lugar if nueva_lugar.strip() else "Ver enlace Google Maps",
+                    "Descripcion": nueva_desc if nueva_desc.strip() else "Sin descripción.",
+                    "Acciones_Tomadas": nuevas_acciones if nuevas_acciones.strip() else "En seguimiento.",
+                    "Latitud": round(nueva_lat, 6),
+                    "Longitud": round(nueva_lon, 6),
+                    "Link_Google_Maps": nuevo_link_maps,
+                    "Archivos_Evidencia": str(reg_act.get("Archivos_Evidencia", "")),
+                    "Auditoria_Telemetria": nueva_auditoria
+                }
+
+                guardar_accidente_db(reg_actualizado)
+                st.success(f"✅ ¡Expediente **{id_sel}** actualizado con éxito en Supabase y archivos locales!")
+                st.rerun()
 
 with menu_tabs[2]:
     st.subheader("🛰️ Cruce con Telemetría GPS")
